@@ -1,6 +1,55 @@
 """
-engine.py -- core strategy logic (trend + breakout + weighted setup score)
+engine.py -- core strategy logic (CANSLIM-inspired: fundamentals gate + technical score)
 Shared by both the CLI script and the Streamlit web app.
+
+WHERE THIS DESIGN CAME FROM (so future changes stay grounded, not vibes):
+  - We backtested strict-AND filtering (contraction AND relative-strength both
+    required) and watched trade count collapse from 162 to 6 with no proven
+    quality gain -- fixed by switching to a WEIGHTED SCORE instead.
+  - We tested fixed-target, pure-trailing, and pure-scaled exits across many
+    runs; all landed in the same -0.12R to +0.02R band -- the exit mechanics
+    were NOT the bottleneck. Ships ONE well-reasoned layered exit instead of
+    three modes to keep re-testing.
+  - After ~15 technical-only configurations, every large-sample result
+    (n>=60) landed in the same near-breakeven band. That's the real finding:
+    a pure PRICE-ACTION breakout has no edge on liquid large-caps. William
+    O'Neil's original CANSLIM was never technical-only -- it required real
+    earnings growth BEFORE the chart pattern even qualified. We'd only ever
+    built the technical half. This version adds the fundamental gate back.
+  - IMPORTANT LIMITATION, stated plainly: yfinance only exposes TODAY's
+    earnings-growth figure, not a point-in-time historical record. Applying
+    today's fundamentals to a trade from 3 years ago would be lookahead bias.
+    So the earnings gate is LIVE-SCREENER-ONLY -- the backtest tab stays
+    technical-only and says so, rather than faking a number that isn't real.
+  - Several component thresholds (breakout volume multiple, contraction
+    strictness, RS lookback window, RS margin) never showed a decisive
+    effect across many tests, so they're fixed sensible constants now
+    instead of exposed sliders -- simpler surface, same behavior.
+
+Strategy, current version:
+  MANDATORY GATES for the BACKTEST and the live screener alike:
+    - Index regime: Nifty Close > its own 20-EMA > its own 50-SMA
+    - Breakout: stock closes above its prior 20-day high
+    - RSI sanity band: not deeply oversold, not blown-off overbought
+
+  MANDATORY GATE, live screener ONLY (can't be backtested honestly):
+    - Real earnings growth: latest quarterly YoY earnings growth exceeds a
+      minimum threshold (the "C" in CANSLIM -- Current earnings growth)
+
+  WEIGHTED SCORE (each worth 2 of 10 points; take the trade if score >= threshold):
+    - Stock trend alignment: Close > SMA50 > SMA200
+    - Relative strength vs Nifty: stock's 63-day return beats Nifty's by a
+      real margin
+    - Volatility contraction: ATR5/ATR20 tight AND recent volume dried up,
+      measured through YESTERDAY, excluding the breakout day itself
+    - Volume expansion: today's volume much higher than its 20-day average
+
+  EXIT (layered, one method):
+    - Initial stop: entry - 1.5x ATR
+    - At +1.5x ATR: move stop to breakeven
+    - At +2.5x ATR: sell 50% of the position, banking real profit
+    - Remaining 50% trails behind price using the tighter of a 20-day
+      structural low or a 2.0x ATR volatility trail
 """
 
 import pandas as pd
@@ -23,6 +72,11 @@ DEFAULT_UNIVERSE = [
     "TATACONSUM.NS",
 ]
 
+# Representative sample of liquid, established mid/small-caps -- NOT the official
+# index list (too many for casual backtesting; many recent IPOs lack history).
+# CAVEAT: testing today's known survivors against past years has survivorship
+# bias baked in. Treat results here as more optimistic than a true point-in-time
+# backtest. Not the default -- pick it deliberately in the sidebar if you want it.
 MIDSMALLCAP_UNIVERSE = [
     "FEDERALBNK.NS", "MCX.NS", "SUZLON.NS", "BHEL.NS", "LAURUSLABS.NS", "POLYCAB.NS",
     "ABCAPITAL.NS", "INDIANB.NS", "PAGEIND.NS", "MPHASIS.NS", "PERSISTENT.NS",
@@ -37,8 +91,7 @@ MIDSMALLCAP_UNIVERSE = [
 ]
 
 DEFAULT_PARAMS = dict(
-    volume_mult=1.5,
-    rsi_low=45, rsi_high=70,
+    # Exposed to the user -- these had real, visible effects across our testing.
     atr_stop_mult=1.5,
     breakeven_mult=1.5,
     partial_target_mult=2.5,
@@ -46,23 +99,31 @@ DEFAULT_PARAMS = dict(
     hold_days=20,
     friction_pct=0.0015,
     score_threshold=7,
+    rsi_low=45, rsi_high=70,
+    min_earnings_growth=0.10,   # live screener only -- 10% YoY quarterly earnings growth
+
+    # Fixed constants -- tested repeatedly this session with no decisive effect
+    # from tuning, so simplified out of the UI rather than left as clutter.
+    volume_mult=1.5,
     rs_lookback=63,
     rs_min_outperformance=0.05,
     contraction_ratio_threshold=0.70,
 )
 
 # ----------------------------------------------------------------------------------
-# INDICATORS & MARKET REGIME
+# INDICATORS
 # ----------------------------------------------------------------------------------
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    # Guard: yfinance sometimes returns a partial/incomplete bar for "today" if
+    # fetched while the market is open, or a stale row with NaN OHLC.
     df = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
 
     df["SMA50"] = df["Close"].rolling(50).mean()
     df["SMA200"] = df["Close"].rolling(200).mean()
-    df["High20"] = df["High"].rolling(20).max().shift(1)
-    df["Low20"] = df["Low"].rolling(20).min().shift(1)
+    df["High20"] = df["High"].rolling(20).max().shift(1)      # prior 20d high, excludes today
+    df["Low20"] = df["Low"].rolling(20).min().shift(1)        # prior 20d low, excludes today
     df["VolAvg20"] = df["Volume"].rolling(20).mean().shift(1)
 
     delta = df["Close"].diff()
@@ -78,6 +139,9 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     ], axis=1).max(axis=1)
     df["ATR14"] = tr.rolling(14).mean()
 
+    # VCP-style contraction: ATR5/ATR20 ratio AND 5-day volume vs 20-day average,
+    # both measured through YESTERDAY (shift(1)) so the breakout day's own
+    # expansion can't contaminate the "was it quiet beforehand" measurement.
     atr5_raw = tr.rolling(5).mean()
     atr20_raw = tr.rolling(20).mean()
     df["ATR_ContractionRatio"] = (atr5_raw / atr20_raw).shift(1)
@@ -91,16 +155,14 @@ def get_nifty_data(start_date: str) -> pd.DataFrame:
     if nifty.empty:
         return pd.DataFrame()
     if isinstance(nifty.columns, pd.MultiIndex):
-        if BENCHMARK_TICKER in nifty.columns.levels[0]:
-            nifty = nifty[BENCHMARK_TICKER]
-        else:
-            nifty.columns = nifty.columns.get_level_values(0)
+        nifty = nifty.xs(BENCHMARK_TICKER, level=1, axis=1)
     nifty["EMA20"] = nifty["Close"].ewm(span=20, adjust=False).mean()
     nifty["SMA50"] = nifty["Close"].rolling(50).mean()
     return nifty
 
 
 def get_market_regime(nifty_df: pd.DataFrame) -> pd.Series:
+    """True only when Nifty is in a real uptrend: Close > 20-EMA > 50-SMA."""
     if nifty_df.empty:
         return pd.Series(dtype=bool)
     cond = (nifty_df["Close"] > nifty_df["EMA20"]) & (nifty_df["EMA20"] > nifty_df["SMA50"])
@@ -108,6 +170,10 @@ def get_market_regime(nifty_df: pd.DataFrame) -> pd.Series:
 
 
 def add_relative_strength(df: pd.DataFrame, nifty_close: pd.Series, lookback: int) -> pd.DataFrame:
+    """RS_Diff = stock's % return over `lookback` days minus Nifty's % return
+    over the same window. A real margin, not a ratio (ratios break when either
+    return is negative -- e.g. a stock down 5% vs Nifty down 20% is a big
+    relative WIN, but the ratio 0.25 looks like a loser)."""
     df = df.copy()
     if nifty_close.empty:
         df["RS_Diff"] = np.nan
@@ -116,11 +182,27 @@ def add_relative_strength(df: pd.DataFrame, nifty_close: pd.Series, lookback: in
     df["RS_Diff"] = df["Close"].pct_change(lookback) - aligned.pct_change(lookback)
     return df
 
+
+def get_earnings_growth(symbol: str):
+    """
+    Latest quarterly YoY earnings growth, as a fraction (0.15 = 15%). None if
+    Yahoo doesn't have it for this symbol. LIVE DATA ONLY -- this reflects
+    TODAY's most recent reported figure, not what was known on any past date,
+    which is exactly why this gate can't be used in the backtest.
+    """
+    try:
+        info = yf.Ticker(symbol).info
+        return info.get("earningsQuarterlyGrowth")
+    except Exception:
+        return None
+
 # ----------------------------------------------------------------------------------
-# ENTRY SIGNAL & SCORING
+# ENTRY SIGNAL: mandatory gates + weighted score
 # ----------------------------------------------------------------------------------
 
 def setup_score(row, market_ok: bool, params: dict) -> int:
+    """Returns -1 if a mandatory gate fails (never a valid setup that day),
+    otherwise 2-10 reflecting how many quality factors lined up."""
     breakout_ok = (
         row["Close"] > row["High20"]
         and params["rsi_low"] <= row["RSI14"] <= params["rsi_high"]
@@ -131,21 +213,21 @@ def setup_score(row, market_ok: bool, params: dict) -> int:
     score = 0
 
     if row["Close"] > row["SMA50"] > row["SMA200"]:
-        score += 2
+        score += 2  # trend alignment
 
     rs_diff = row.get("RS_Diff")
     if pd.notna(rs_diff) and rs_diff > params.get("rs_min_outperformance", 0.05):
-        score += 2
+        score += 2  # meaningful relative strength vs Nifty
 
     ratio = row.get("ATR_ContractionRatio")
     vol5 = row.get("Vol5Avg")
     vol20 = row.get("VolAvg20")
     if pd.notna(ratio) and pd.notna(vol5) and pd.notna(vol20):
         if ratio < params.get("contraction_ratio_threshold", 0.70) and vol5 < vol20:
-            score += 2
+            score += 2  # price AND volume both dried up before the breakout
 
     if row["Volume"] >= params["volume_mult"] * row["VolAvg20"]:
-        score += 2
+        score += 2  # volume expansion on the breakout day itself
 
     return score
 
@@ -154,10 +236,15 @@ def entry_signal(row, market_ok: bool, params: dict) -> bool:
     return setup_score(row, market_ok, params) >= params.get("score_threshold", 7)
 
 # ----------------------------------------------------------------------------------
-# EXIT SIMULATION
+# LAYERED EXIT SIMULATION (used by both backtest and live position tracking)
 # ----------------------------------------------------------------------------------
 
 def simulate_layered_exit(df: pd.DataFrame, i: int, entry_price: float, atr_entry: float, params: dict):
+    """
+    df is the reset-index'd, per-symbol frame; i is the signal-day row index
+    (entry happens at df.iloc[i+1]'s open, already priced into entry_price).
+    Returns (r_multiple, days_held, exit_index).
+    """
     fric = params["friction_pct"]
     initial_stop = entry_price - params["atr_stop_mult"] * atr_entry
     stop = initial_stop
@@ -184,7 +271,7 @@ def simulate_layered_exit(df: pd.DataFrame, i: int, entry_price: float, atr_entr
                 r_multiple = (exit_price - entry_price) / (entry_price - initial_stop)
                 break
             if day["High"] >= breakeven_trigger:
-                stop = max(stop, entry_price)
+                stop = max(stop, entry_price)  # lock in "can't lose" early
             if day["High"] >= partial_trigger:
                 partial_taken = True
                 partial_exit = partial_trigger * (1 - fric)
@@ -200,7 +287,7 @@ def simulate_layered_exit(df: pd.DataFrame, i: int, entry_price: float, atr_entr
             highest_close = max(highest_close, day["Close"])
             atr_trail = highest_close - runner_trail_mult * day_atr
             structural_trail = day["Low20"] if pd.notna(day.get("Low20")) else atr_trail
-            stop = max(stop, atr_trail, structural_trail)
+            stop = max(stop, atr_trail, structural_trail)  # tighter (higher) of the two
 
     if r_multiple is None:
         exit_index = min(i + params["hold_days"], len(df) - 1)
@@ -240,7 +327,7 @@ def backtest_symbol(df: pd.DataFrame, market_regime: pd.Series, params: dict) ->
                 "days_held": days_held,
                 "setup_score": setup_score(row, mkt_ok, params),
             })
-            i = exit_index + 1
+            i = exit_index + 1  # resume right after THIS trade closes
         else:
             i += 1
     return trades
@@ -252,18 +339,13 @@ def run_backtest(universe, years, params) -> tuple[pd.DataFrame, dict]:
     market_regime = get_market_regime(nifty_df)
     nifty_close = nifty_df["Close"] if not nifty_df.empty else pd.Series(dtype=float)
 
-    data = yf.download(universe, start=start, group_by="ticker", auto_adjust=True, progress=False, threads=True)
+    data = yf.download(universe, start=start, group_by="ticker", auto_adjust=True,
+                        progress=False, threads=True)
 
     all_trades = []
     for sym in universe:
         try:
-            if isinstance(data.columns, pd.MultiIndex):
-                if sym not in data.columns.levels[0]:
-                    continue
-                df = data[sym].dropna(how="all")
-            else:
-                df = data.dropna(how="all")
-
+            df = data[sym].dropna(how="all")
             if len(df) < 210:
                 continue
             df = compute_indicators(df)
@@ -292,7 +374,7 @@ def run_backtest(universe, years, params) -> tuple[pd.DataFrame, dict]:
     return trades_df, summary
 
 # ----------------------------------------------------------------------------------
-# SCREEN TODAY
+# TODAY'S SCREENER
 # ----------------------------------------------------------------------------------
 
 def screen_today(universe, capital, risk_pct, params) -> tuple[pd.DataFrame, bool]:
@@ -305,19 +387,14 @@ def screen_today(universe, capital, risk_pct, params) -> tuple[pd.DataFrame, boo
     if not is_bullish:
         return pd.DataFrame(), False
 
-    data = yf.download(universe, start=start, group_by="ticker", auto_adjust=True, progress=False, threads=True)
+    data = yf.download(universe, start=start, group_by="ticker", auto_adjust=True,
+                        progress=False, threads=True)
     max_risk_amount = capital * risk_pct
 
     rows = []
     for sym in universe:
         try:
-            if isinstance(data.columns, pd.MultiIndex):
-                if sym not in data.columns.levels[0]:
-                    continue
-                df = data[sym].dropna(how="all")
-            else:
-                df = data.dropna(how="all")
-
+            df = data[sym].dropna(how="all")
             if len(df) < 210:
                 continue
             df = compute_indicators(df)
@@ -327,6 +404,13 @@ def screen_today(universe, capital, risk_pct, params) -> tuple[pd.DataFrame, boo
                 continue
             score = setup_score(last, is_bullish, params)
             if score >= params.get("score_threshold", 7):
+                # Fundamental gate, live-only: only spend the extra API call on
+                # names that already passed the technical bar.
+                earnings_growth = get_earnings_growth(sym)
+                min_growth = params.get("min_earnings_growth", 0.10)
+                if earnings_growth is None or earnings_growth < min_growth:
+                    continue  # no confirmed real earnings growth -- skip, CANSLIM-style
+
                 atr = last["ATR14"]
                 entry = last["Close"]
                 stop = entry - params["atr_stop_mult"] * atr
@@ -345,6 +429,7 @@ def screen_today(universe, capital, risk_pct, params) -> tuple[pd.DataFrame, boo
                     "Qty (at your risk budget)": shares,
                     "Capital Req (Rs)": round(shares * entry, 2),
                     "Risk %": round(risk_per_share / entry * 100, 2),
+                    "Earnings Growth YoY": f"{earnings_growth*100:.1f}%",
                     "_score_num": score,
                     "Setup Score": f"{score}/10",
                     "RSI14": round(last["RSI14"], 1),
@@ -358,30 +443,30 @@ def screen_today(universe, capital, risk_pct, params) -> tuple[pd.DataFrame, boo
     return watchlist, True
 
 # ----------------------------------------------------------------------------------
-# POSITION EVALUATION
+# OPEN POSITION TRACKING -- sell/exit signals for stocks you already bought
 # ----------------------------------------------------------------------------------
 
 def evaluate_positions(positions: pd.DataFrame, params: dict) -> pd.DataFrame:
+    """
+    positions columns required: Symbol, Entry Date, Entry Price, Qty, Stop, Target
+    (Target here is treated as the user's own reference/partial-target level --
+    this function reports live status, it doesn't re-simulate the layered exit.)
+    """
     if positions.empty:
         return positions
 
     symbols = [s if s.endswith(".NS") else f"{s}.NS" for s in positions["Symbol"]]
     start = (datetime.now() - timedelta(days=400)).strftime("%Y-%m-%d")
-    data = yf.download(symbols, start=start, group_by="ticker", auto_adjust=True, progress=False, threads=True)
+    data = yf.download(symbols, start=start, group_by="ticker", auto_adjust=True,
+                        progress=False, threads=True)
 
     out_rows = []
     for _, pos in positions.iterrows():
         sym = str(pos["Symbol"])
         yf_sym = sym if sym.endswith(".NS") else f"{sym}.NS"
         try:
-            if isinstance(data.columns, pd.MultiIndex):
-                if yf_sym in data.columns.levels[0]:
-                    df = data[yf_sym].dropna(how="all")
-                else:
-                    df = data.dropna(how="all")
-            else:
-                df = data.dropna(how="all")
-
+            df = data[yf_sym] if len(symbols) > 1 else data
+            df = df.dropna(how="all")
             df = compute_indicators(df)
             last = df.iloc[-1]
 
