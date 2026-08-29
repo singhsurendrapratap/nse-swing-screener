@@ -1,10 +1,5 @@
 """
 NSE Swing Screener -- Web App
-==============================
-Run with:  streamlit run app.py
-
-Deploy for free (URL works on phone/laptop anytime) at https://streamlit.io/cloud --
-push these files to a GitHub repo, connect it, done.
 """
 
 import os
@@ -39,7 +34,7 @@ st.caption(
 )
 
 # ---------------------------------------------------------------------------
-# SIDEBAR -- kept intentionally short: the knobs that actually matter
+# SIDEBAR
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("Settings")
@@ -90,8 +85,7 @@ with st.sidebar:
     if universe_choice.startswith("Mid"):
         st.caption(
             "⚠️ Representative sample of TODAY's liquid mid/smallcaps, tested against "
-            "PAST years -- delisted/crashed-out stocks aren't included. Treat results "
-            "here as more optimistic than a true point-in-time backtest (survivorship bias)."
+            "PAST years -- delisted/crashed-out stocks aren't included."
         )
         default_universe = MIDSMALLCAP_UNIVERSE
     else:
@@ -112,14 +106,14 @@ params = dict(
 tab1, tab2, tab3 = st.tabs(["🎯 Today's Watchlist", "📊 Backtest", "📌 My Positions"])
 
 # ---------------------------------------------------------------------------
-# TAB 1 -- today's picks, with buy/sell info
+# TAB 1 -- TODAY'S PICKS
 # ---------------------------------------------------------------------------
 with tab1:
     st.subheader("Today's qualifying setups")
     st.write(
         f"Screens the latest close for every stock in your universe, scores each "
         f"against the 4 weighted factors, and shows only those scoring "
-        f"**{score_threshold}/10 or higher** (plus the mandatory regime/breakout/RSI gates)."
+        f"**{score_threshold}/10 or higher** (plus mandatory gates)."
     )
     if st.button("🔄 Screen today's market", type="primary"):
         with st.spinner("Fetching latest NSE data and screening..."):
@@ -128,14 +122,11 @@ with tab1:
         if not market_bullish:
             st.warning(
                 "**Market regime filter: OFF.** Nifty 50 isn't in a confirmed uptrend "
-                "(needs Close > 20-EMA > 50-SMA) -- no long setups suggested today. "
-                "This strategy sits out downtrends on purpose."
+                "(needs Close > 20-EMA > 50-SMA) -- no long setups suggested today."
             )
         elif watchlist.empty:
             st.info(
-                "No setups scored high enough today. That's a normal, valid outcome "
-                "for a selective strategy -- don't force a trade because the screen "
-                "came up empty."
+                "No setups scored high enough today. That's a normal, valid outcome."
             )
         else:
             st.success(f"{len(watchlist)} setup(s) found.")
@@ -144,25 +135,15 @@ with tab1:
                 "Download as CSV", watchlist.to_csv(index=False),
                 file_name="todays_watchlist.csv", mime="text/csv",
             )
-            st.caption(
-                "Qty is sized so a stop-loss hit only costs your chosen risk % of "
-                "total capital. Exit plan: move stop to breakeven at the listed level, "
-                "sell half at the partial target, trail the rest."
-            )
 
 # ---------------------------------------------------------------------------
-# TAB 2 -- backtest, so claims are checkable
+# TAB 2 -- BACKTEST
 # ---------------------------------------------------------------------------
 with tab2:
     st.subheader("Historical performance of this exact strategy")
     st.caption(
         f"Weighted score, needs **{score_threshold}/10** | Layered exit "
-        f"(breakeven @{breakeven_mult}x ATR, 50% @{partial_target_mult}x ATR, "
-        f"trail @{runner_trail_mult}x ATR) | Universe: {universe_choice}"
-    )
-    st.write(
-        "Runs the same rules over the past N years so you can see the real win rate "
-        "and expectancy before trusting today's picks."
+        f"| Universe: {universe_choice}"
     )
     if st.button("▶️ Run backtest"):
         with st.spinner(f"Backtesting {len(universe)} stocks over {backtest_years} years..."):
@@ -176,32 +157,17 @@ with tab2:
             c2.metric("Win rate", f"{summary['win_rate']:.1f}%")
             c3.metric("Expectancy / trade", f"{summary['expectancy_r']:.2f}R")
             c4.metric("Avg days held", f"{summary['avg_days_held']:.1f}")
-            st.caption(
-                "R = multiples of amount risked per trade. Expectancy matters more than "
-                "win rate: a 45% win rate with +0.6R expectancy beats a 65% win rate with -0.1R."
-            )
             st.markdown(f"Avg win: **{summary['avg_win_r']:.2f}R** &nbsp;|&nbsp; "
                         f"Avg loss: **{summary['avg_loss_r']:.2f}R**")
-            if summary["total_trades"] < 30:
-                st.warning(
-                    f"Only {summary['total_trades']} trades -- too small a sample to "
-                    "trust the win rate or expectancy on their own. Widen the universe "
-                    "or backtest years before drawing conclusions."
-                )
             st.divider()
             st.dataframe(trades_df.sort_values("entry_date", ascending=False),
                         use_container_width=True, hide_index=True)
 
 # ---------------------------------------------------------------------------
-# TAB 3 -- track your open positions, get live sell/exit signals
+# TAB 3 -- MY POSITIONS
 # ---------------------------------------------------------------------------
 with tab3:
     st.subheader("Track positions you've already bought")
-    st.write(
-        "Add a stock you're holding once. Every time you open this app, it re-checks "
-        "the latest price against your stop/target and tells you HOLD or SELL."
-    )
-
     positions = load_positions()
 
     with st.form("add_position", clear_on_submit=True):
@@ -249,11 +215,6 @@ with tab3:
 
             st.dataframe(status_df.style.apply(_highlight, axis=1),
                         use_container_width=True, hide_index=True)
-            st.caption(
-                "Red = sell signal triggered. Yellow = trend weakening, worth a look. "
-                "'Suggested Trailing Stop' only ever moves up -- update your broker's "
-                "stop-loss order to match it if you want to lock in gains."
-            )
         else:
             st.info("Click 'Refresh signals' to check your positions against live prices.")
 
@@ -266,11 +227,3 @@ with tab3:
             st.session_state.pop("position_status", None)
             st.success(f"Removed {to_remove}.")
             st.rerun()
-
-st.divider()
-st.caption(
-    "⚠️ Educational tool, not investment advice. Past performance does not guarantee "
-    "future results. Always size positions to a risk % you can afford to lose repeatedly. "
-    "Note: on free cloud hosting, the positions file may reset if the app restarts/"
-    "redeploys -- download a backup periodically if that matters to you."
-)
