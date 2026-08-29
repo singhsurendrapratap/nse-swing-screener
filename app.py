@@ -3,16 +3,18 @@ NSE Swing Screener -- Web App
 ==============================
 Run with:  streamlit run app.py
 
-Deploy for free (so you get a real URL, open on phone/laptop anytime) at
-https://streamlit.io/cloud -- push these files to a GitHub repo, connect it,
-done. No server management needed.
+Deploy for free (URL works on phone/laptop anytime) at https://streamlit.io/cloud --
+push these files to a GitHub repo, connect it, done.
 """
 
 import os
 import streamlit as st
 import pandas as pd
 from datetime import date
-from engine import DEFAULT_UNIVERSE, run_backtest, screen_today, evaluate_positions
+from engine import (
+    DEFAULT_UNIVERSE, MIDSMALLCAP_UNIVERSE, DEFAULT_PARAMS,
+    run_backtest, screen_today, evaluate_positions,
+)
 
 POSITIONS_FILE = "positions.csv"
 POSITIONS_COLS = ["Symbol", "Entry Date", "Entry Price", "Qty", "Stop", "Target"]
@@ -27,72 +29,84 @@ def load_positions() -> pd.DataFrame:
 def save_positions(df: pd.DataFrame):
     df.to_csv(POSITIONS_FILE, index=False)
 
+
 st.set_page_config(page_title="NSE Swing Screener", layout="wide")
 st.title("📈 NSE Swing / Positional Screener")
 st.caption(
-    "Trend + breakout + volume strategy, with a Nifty-50 market-regime filter, "
-    "realistic next-day-open execution, friction costs, and risk-based position sizing. "
-    "Not financial advice -- a transparent tool so you can see and test the logic yourself."
+    "Trend + breakout, filtered by a weighted setup score, with a layered exit "
+    "(breakeven-early, partial profit, trail the rest). Not financial advice -- "
+    "a transparent tool so you can see and test the logic yourself."
 )
 
 # ---------------------------------------------------------------------------
-# SIDEBAR -- all the knobs, nothing hidden
+# SIDEBAR -- kept intentionally short: the knobs that actually matter
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("Settings")
     capital = st.number_input("Total capital (Rs)", min_value=10000, value=500000, step=10000)
     risk_pct = st.slider("Risk per trade (%)", 0.25, 3.0, 1.0, 0.25) / 100
+
     st.divider()
-    st.subheader("Strategy parameters")
-    volume_mult = st.slider("Breakout volume multiple", 1.0, 3.0, 1.5, 0.1)
-    rsi_low, rsi_high = st.slider("RSI band", 0, 100, (45, 70))
-    atr_stop = st.slider("Stop-loss (x ATR)", 0.5, 3.0, 1.5, 0.1)
-    use_trailing_stop = st.checkbox(
-        "Use trailing stop instead of fixed target",
-        value=False,
-        help="Instead of exiting at a fixed 2:1/3:1 target, let the stop ratchet up "
-             "behind the price and only exit when it's hit. Lets winners run further, "
-             "at the cost of a less predictable exit price.",
+    st.subheader("Setup score")
+    score_threshold = st.slider(
+        "Minimum score required (out of 10)", 2, 10, DEFAULT_PARAMS["score_threshold"], 2,
+        help="Trend alignment, relative strength, volatility contraction, and volume "
+             "expansion each contribute 2 points. Market regime, breakout, and RSI "
+             "band are separate mandatory gates -- always required regardless of score.",
     )
-    atr_target = st.slider("Target (x ATR)", 1.0, 6.0, 3.0, 0.1, disabled=use_trailing_stop)
-    hold_days = st.slider("Max hold (trading days)", 5, 40, 15)
-    friction_pct = st.slider("Friction: brokerage+STT+slippage (%)", 0.0, 0.5, 0.15, 0.05) / 100
+    with st.expander("Score component thresholds"):
+        rs_min_outperformance = st.slider(
+            "Min relative-strength margin vs Nifty (%)", 0, 30,
+            int(DEFAULT_PARAMS["rs_min_outperformance"] * 100), 1,
+        ) / 100
+        contraction_ratio_threshold = st.slider(
+            "Contraction strictness (ATR5/ATR20 must be below)", 0.4, 1.0,
+            DEFAULT_PARAMS["contraction_ratio_threshold"], 0.05,
+        )
+        volume_mult = st.slider(
+            "Breakout volume multiple", 1.0, 3.0, DEFAULT_PARAMS["volume_mult"], 0.1,
+        )
+        rs_lookback = st.slider(
+            "Relative strength lookback (days)", 20, 120, DEFAULT_PARAMS["rs_lookback"], 1,
+        )
+
     st.divider()
-    st.subheader("Entry quality filters (new)")
-    require_contraction = st.checkbox(
-        "Require volatility contraction before breakout",
-        value=True,
-        help="Only take breakouts where the stock was tightening into a narrower "
-             "range beforehand (VCP-style squeeze), not a random spike. Aims to "
-             "cut down false/whipsaw breakouts.",
-    )
-    contraction_threshold = st.slider(
-        "Contraction strictness", 0.5, 1.0, 0.75, 0.05,
-        disabled=not require_contraction,
-        help="Lower = stricter squeeze required (current 10-day range must be "
-             "tighter than this fraction of its own 60-day average range).",
-    )
-    require_rs = st.checkbox(
-        "Require relative strength vs Nifty",
-        value=True,
-        help="Only take breakouts in stocks that have been outperforming the "
-             "Nifty 50 over the lookback window, not just moving with the market.",
-    )
-    rs_lookback = st.slider(
-        "Relative strength lookback (days)", 20, 120, 63, 1,
-        disabled=not require_rs,
-    )
+    st.subheader("Exit (layered)")
+    with st.expander("Exit thresholds"):
+        atr_stop = st.slider("Initial stop-loss (x ATR)", 0.5, 3.0, DEFAULT_PARAMS["atr_stop_mult"], 0.1)
+        breakeven_mult = st.slider("Move to breakeven at (x ATR)", 0.5, 3.0, DEFAULT_PARAMS["breakeven_mult"], 0.1)
+        partial_target_mult = st.slider("Sell 50% at (x ATR)", 1.0, 5.0, DEFAULT_PARAMS["partial_target_mult"], 0.1)
+        runner_trail_mult = st.slider("Trail the rest (x ATR)", 1.0, 4.0, DEFAULT_PARAMS["runner_trail_mult"], 0.1)
+        hold_days = st.slider("Max hold (trading days)", 5, 60, DEFAULT_PARAMS["hold_days"])
+        friction_pct = st.slider("Friction: brokerage+STT+slippage (%)", 0.0, 0.5, 0.15, 0.05) / 100
+        rsi_low, rsi_high = st.slider("RSI sanity band", 0, 100, (DEFAULT_PARAMS["rsi_low"], DEFAULT_PARAMS["rsi_high"]))
+
     st.divider()
-    universe = st.multiselect("Universe (NSE tickers)", DEFAULT_UNIVERSE, default=DEFAULT_UNIVERSE)
+    universe_choice = st.radio(
+        "Universe",
+        ["Large-cap (Nifty 50-ish)", "Mid/Small-cap (higher momentum, higher risk)"],
+        index=0,
+    )
+    if universe_choice.startswith("Mid"):
+        st.caption(
+            "⚠️ Representative sample of TODAY's liquid mid/smallcaps, tested against "
+            "PAST years -- delisted/crashed-out stocks aren't included. Treat results "
+            "here as more optimistic than a true point-in-time backtest (survivorship bias)."
+        )
+        default_universe = MIDSMALLCAP_UNIVERSE
+    else:
+        default_universe = DEFAULT_UNIVERSE
+    universe = st.multiselect("Tickers", default_universe, default=default_universe)
     backtest_years = st.slider("Backtest lookback (years)", 1, 5, 3)
 
 params = dict(
     volume_mult=volume_mult, rsi_low=rsi_low, rsi_high=rsi_high,
-    atr_stop_mult=atr_stop, atr_target_mult=atr_target,
+    atr_stop_mult=atr_stop, breakeven_mult=breakeven_mult,
+    partial_target_mult=partial_target_mult, runner_trail_mult=runner_trail_mult,
     hold_days=hold_days, friction_pct=friction_pct,
-    use_trailing_stop=use_trailing_stop,
-    require_contraction=require_contraction, contraction_threshold=contraction_threshold,
-    require_rs=require_rs, rs_lookback=rs_lookback,
+    score_threshold=score_threshold, rs_lookback=rs_lookback,
+    rs_min_outperformance=rs_min_outperformance,
+    contraction_ratio_threshold=contraction_ratio_threshold,
 )
 
 tab1, tab2, tab3 = st.tabs(["🎯 Today's Watchlist", "📊 Backtest", "📌 My Positions"])
@@ -103,8 +117,9 @@ tab1, tab2, tab3 = st.tabs(["🎯 Today's Watchlist", "📊 Backtest", "📌 My 
 with tab1:
     st.subheader("Today's qualifying setups")
     st.write(
-        "Click below to pull the **latest close** for every stock in your universe and "
-        "screen it against the strategy right now. Kept intentionally short (quality over quantity)."
+        f"Screens the latest close for every stock in your universe, scores each "
+        f"against the 4 weighted factors, and shows only those scoring "
+        f"**{score_threshold}/10 or higher** (plus the mandatory regime/breakout/RSI gates)."
     )
     if st.button("🔄 Screen today's market", type="primary"):
         with st.spinner("Fetching latest NSE data and screening..."):
@@ -112,26 +127,27 @@ with tab1:
 
         if not market_bullish:
             st.warning(
-                "**Market regime filter: OFF.** Nifty 50 is currently below its 50-day average, "
-                "so no long setups are being suggested today -- this strategy sits out downtrends "
-                "on purpose rather than fighting the broader market."
+                "**Market regime filter: OFF.** Nifty 50 isn't in a confirmed uptrend "
+                "(needs Close > 20-EMA > 50-SMA) -- no long setups suggested today. "
+                "This strategy sits out downtrends on purpose."
             )
         elif watchlist.empty:
             st.info(
-                "No qualifying setups today. That's a normal, valid outcome for a selective "
-                "strategy -- don't force a trade because the screen came up empty."
+                "No setups scored high enough today. That's a normal, valid outcome "
+                "for a selective strategy -- don't force a trade because the screen "
+                "came up empty."
             )
         else:
-            st.success(f"{len(watchlist)} setup(s) found. 'Buy Near' = suggested entry; "
-                       "'Stop-Loss' and 'Target' are your planned exits.")
+            st.success(f"{len(watchlist)} setup(s) found.")
             st.dataframe(watchlist, use_container_width=True, hide_index=True)
             st.download_button(
                 "Download as CSV", watchlist.to_csv(index=False),
                 file_name="todays_watchlist.csv", mime="text/csv",
             )
             st.caption(
-                "Qty is sized so that if the stop-loss is hit, you lose only your chosen "
-                "risk % of total capital on that trade -- not a full-conviction bet."
+                "Qty is sized so a stop-loss hit only costs your chosen risk % of "
+                "total capital. Exit plan: move stop to breakeven at the listed level, "
+                "sell half at the partial target, trail the rest."
             )
 
 # ---------------------------------------------------------------------------
@@ -139,13 +155,14 @@ with tab1:
 # ---------------------------------------------------------------------------
 with tab2:
     st.subheader("Historical performance of this exact strategy")
-    if params["use_trailing_stop"]:
-        st.success("🟢 Mode: **TRAILING STOP** (no fixed target — stop ratchets up behind price)")
-    else:
-        st.info("🔵 Mode: **FIXED TARGET** (exits at a fixed 3x-ATR target)")
+    st.caption(
+        f"Weighted score, needs **{score_threshold}/10** | Layered exit "
+        f"(breakeven @{breakeven_mult}x ATR, 50% @{partial_target_mult}x ATR, "
+        f"trail @{runner_trail_mult}x ATR) | Universe: {universe_choice}"
+    )
     st.write(
-        "Runs the same rules over the past N years so you can see the real win rate and "
-        "expectancy before trusting today's picks."
+        "Runs the same rules over the past N years so you can see the real win rate "
+        "and expectancy before trusting today's picks."
     )
     if st.button("▶️ Run backtest"):
         with st.spinner(f"Backtesting {len(universe)} stocks over {backtest_years} years..."):
@@ -154,24 +171,23 @@ with tab2:
         if not summary:
             st.info("No trades generated in this period with these settings.")
         else:
-            filters_on = []
-            if params.get("require_contraction"):
-                filters_on.append("Volatility Contraction")
-            if params.get("require_rs"):
-                filters_on.append("Relative Strength")
-            filters_label = " + ".join(filters_on) if filters_on else "None"
-            st.caption(f"**These results were generated using: {summary['mode']} | Entry filters: {filters_label}**")
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Total trades", summary["total_trades"])
             c2.metric("Win rate", f"{summary['win_rate']:.1f}%")
             c3.metric("Expectancy / trade", f"{summary['expectancy_r']:.2f}R")
             c4.metric("Avg days held", f"{summary['avg_days_held']:.1f}")
             st.caption(
-                "R = multiples of amount risked per trade. Expectancy matters more than win "
-                "rate: a 45% win rate with +0.6R expectancy beats a 65% win rate with -0.1R."
+                "R = multiples of amount risked per trade. Expectancy matters more than "
+                "win rate: a 45% win rate with +0.6R expectancy beats a 65% win rate with -0.1R."
             )
             st.markdown(f"Avg win: **{summary['avg_win_r']:.2f}R** &nbsp;|&nbsp; "
                         f"Avg loss: **{summary['avg_loss_r']:.2f}R**")
+            if summary["total_trades"] < 30:
+                st.warning(
+                    f"Only {summary['total_trades']} trades -- too small a sample to "
+                    "trust the win rate or expectancy on their own. Widen the universe "
+                    "or backtest years before drawing conclusions."
+                )
             st.divider()
             st.dataframe(trades_df.sort_values("entry_date", ascending=False),
                         use_container_width=True, hide_index=True)
@@ -182,9 +198,8 @@ with tab2:
 with tab3:
     st.subheader("Track positions you've already bought")
     st.write(
-        "Add a stock you're holding once. Every time you open this app, it re-checks the "
-        "latest price against your stop/target and tells you HOLD or SELL -- and suggests a "
-        "trailing stop that only ever moves up, so you can lock in gains without babysitting it."
+        "Add a stock you're holding once. Every time you open this app, it re-checks "
+        "the latest price against your stop/target and tells you HOLD or SELL."
     )
 
     positions = load_positions()
@@ -200,7 +215,7 @@ with tab3:
             qty = st.number_input("Qty", min_value=1, step=1)
         with c3:
             stop = st.number_input("Stop-loss (Rs)", min_value=0.0, step=0.5)
-            target = st.number_input("Target (Rs)", min_value=0.0, step=0.5)
+            target = st.number_input("Partial target (Rs)", min_value=0.0, step=0.5)
         submitted = st.form_submit_button("➕ Add position")
         if submitted and symbol and entry_price > 0:
             new_row = pd.DataFrame([{
@@ -236,8 +251,8 @@ with tab3:
                         use_container_width=True, hide_index=True)
             st.caption(
                 "Red = sell signal triggered. Yellow = trend weakening, worth a look. "
-                "'Suggested Trailing Stop' only ever moves up from your original stop -- "
-                "update your broker's stop-loss order to match it if you want to lock in gains."
+                "'Suggested Trailing Stop' only ever moves up -- update your broker's "
+                "stop-loss order to match it if you want to lock in gains."
             )
         else:
             st.info("Click 'Refresh signals' to check your positions against live prices.")
@@ -254,8 +269,8 @@ with tab3:
 
 st.divider()
 st.caption(
-    "⚠️ Educational tool, not investment advice. Past performance does not guarantee future "
-    "results. Always size positions to a risk % you can afford to lose repeatedly. "
-    "Note: on free cloud hosting, the positions file may reset if the app restarts/redeploys -- "
-    "download a backup periodically if that matters to you."
+    "⚠️ Educational tool, not investment advice. Past performance does not guarantee "
+    "future results. Always size positions to a risk % you can afford to lose repeatedly. "
+    "Note: on free cloud hosting, the positions file may reset if the app restarts/"
+    "redeploys -- download a backup periodically if that matters to you."
 )
