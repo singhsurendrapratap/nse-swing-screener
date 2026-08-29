@@ -59,13 +59,14 @@ with st.sidebar:
     st.divider()
     st.subheader("Fundamental gate (live screener only)")
     min_earnings_growth = st.slider(
-        "Min quarterly earnings growth, YoY (%)", 0, 50,
-        int(DEFAULT_PARAMS["min_earnings_growth"] * 100), 5,
-        help="CANSLIM's 'Current earnings growth' check -- only stocks with real, "
-             "recent earnings growth qualify, not price action alone. This can't be "
-             "backtested honestly (Yahoo only gives today's figure, not history), "
-             "so it applies to the live watchlist only -- see the Backtest tab caption.",
-    ) / 100
+    "Min quarterly earnings growth, YoY (%)", 0, 50,
+    int(DEFAULT_PARAMS.get("min_earnings_growth", 0.10) * 100), 5,  # <-- EDIT THIS LINE
+    help="CANSLIM's 'Current earnings growth' check -- only stocks with real, "
+         "recent earnings growth qualify, not price action alone. This can't be "
+         "backtested honestly (Yahoo only gives today's figure, not history), "
+         "so it applies to the live watchlist only -- see the Backtest tab caption.",
+) / 100
+
 
     st.divider()
     st.subheader("Exit (layered)")
