@@ -49,24 +49,24 @@ with st.sidebar:
     st.divider()
     st.subheader("Setup score")
     score_threshold = st.slider(
-        "Minimum score required (out of 10)", 2, 10, DEFAULT_PARAMS["score_threshold"], 2,
+        "Minimum score required (out of 8)", 2, 8, DEFAULT_PARAMS["score_threshold"], 2,
         help="Trend alignment, relative strength, volatility contraction, and volume "
-             "expansion each contribute 2 points. Market regime, breakout, and RSI "
-             "band are separate mandatory gates -- always required regardless of score.",
+             "expansion each contribute 2 points -- 4 factors x 2 = 8 max. Market "
+             "regime, breakout, and RSI band are separate mandatory gates, always "
+             "required regardless of score. 6 = need 3 of the 4 factors; 8 = need all 4.",
     )
     rsi_low, rsi_high = st.slider("RSI sanity band", 0, 100, (DEFAULT_PARAMS["rsi_low"], DEFAULT_PARAMS["rsi_high"]))
 
     st.divider()
     st.subheader("Fundamental gate (live screener only)")
     min_earnings_growth = st.slider(
-    "Min quarterly earnings growth, YoY (%)", 0, 50,
-    int(DEFAULT_PARAMS.get("min_earnings_growth", 0.10) * 100), 5,  # <-- EDIT THIS LINE
-    help="CANSLIM's 'Current earnings growth' check -- only stocks with real, "
-         "recent earnings growth qualify, not price action alone. This can't be "
-         "backtested honestly (Yahoo only gives today's figure, not history), "
-         "so it applies to the live watchlist only -- see the Backtest tab caption.",
-) / 100
-
+        "Min quarterly earnings growth, YoY (%)", 0, 50,
+        int(DEFAULT_PARAMS["min_earnings_growth"] * 100), 5,
+        help="CANSLIM's 'Current earnings growth' check -- only stocks with real, "
+             "recent earnings growth qualify, not price action alone. This can't be "
+             "backtested honestly (Yahoo only gives today's figure, not history), "
+             "so it applies to the live watchlist only -- see the Backtest tab caption.",
+    ) / 100
 
     st.divider()
     st.subheader("Exit (layered)")
@@ -122,7 +122,7 @@ with tab1:
     st.write(
         f"Screens the latest close for every stock in your universe, scores each "
         f"against the 4 weighted factors, and shows only those scoring "
-        f"**{score_threshold}/10 or higher** (plus the mandatory regime/breakout/RSI gates) "
+        f"**{score_threshold}/8 or higher** (plus the mandatory regime/breakout/RSI gates) "
         f"AND showing real earnings growth of at least **{min_earnings_growth*100:.0f}% YoY** "
         f"(CANSLIM-style -- price action alone isn't enough)."
     )
@@ -162,7 +162,7 @@ with tab1:
 with tab2:
     st.subheader("Historical performance of this exact strategy")
     st.caption(
-        f"Weighted score, needs **{score_threshold}/10** | Layered exit "
+        f"Weighted score, needs **{score_threshold}/8** | Layered exit "
         f"(breakeven @{breakeven_mult}x ATR, 50% @{partial_target_mult}x ATR, "
         f"trail @{runner_trail_mult}x ATR) | Universe: {universe_choice}"
     )
