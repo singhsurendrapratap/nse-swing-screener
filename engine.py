@@ -66,6 +66,40 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
         (df["Low"] - df["Close"].shift()).abs(),
     ], axis=1).max(axis=1)
     df["ATR14"] = tr.rolling(14).mean()
+
+    # Volatility contraction (VCP-lite): is the recent 10-day trading range
+    # tighter than its own typical 60-day range? A genuine squeeze before a
+    # breakout (institutional accumulation) vs. a random spike out of nowhere.
+    df["Range10"] = (df["High"].rolling(10).max() - df["Low"].rolling(10).min()) / df["Close"]
+    df["Range10Avg60"] = df["Range10"].rolling(60).mean()
+
+    return df
+
+
+def get_nifty_close(start_date: str) -> pd.Series:
+    """Raw Nifty 50 close series, used for relative-strength comparisons."""
+    nifty = yf.download(BENCHMARK_TICKER, start=start_date, auto_adjust=True, progress=False)
+    if nifty.empty:
+        return pd.Series(dtype=float)
+    if isinstance(nifty.columns, pd.MultiIndex):
+        nifty = nifty.xs(BENCHMARK_TICKER, level=1, axis=1)
+    return nifty["Close"]
+
+
+def add_relative_strength(df: pd.DataFrame, nifty_close: pd.Series, lookback: int = 63) -> pd.DataFrame:
+    """
+    RS_Diff = stock's % return over `lookback` days minus Nifty's % return over
+    the same window. Positive means the stock has been outperforming the index
+    (CANSLIM-style relative strength) -- not just moving with market noise.
+    """
+    df = df.copy()
+    if nifty_close.empty:
+        df["RS_Diff"] = np.nan
+        return df
+    aligned = nifty_close.reindex(df.index, method="ffill")
+    stock_ret = df["Close"].pct_change(lookback)
+    nifty_ret = aligned.pct_change(lookback)
+    df["RS_Diff"] = stock_ret - nifty_ret
     return df
 
 
@@ -80,14 +114,30 @@ def get_market_regime(start_date: str) -> pd.Series:
     return (nifty["Close"] > sma50).rename("bullish")
 
 
-def signal_condition(row, market_ok: bool, volume_mult: float, rsi_low: float, rsi_high: float) -> bool:
-    return (
+def signal_condition(row, market_ok: bool, params: dict) -> bool:
+    base = (
         market_ok
         and row["Close"] > row["SMA50"] > row["SMA200"]
         and row["Close"] > row["High20"]
-        and row["Volume"] >= volume_mult * row["VolAvg20"]
-        and rsi_low <= row["RSI14"] <= rsi_high
+        and row["Volume"] >= params["volume_mult"] * row["VolAvg20"]
+        and params["rsi_low"] <= row["RSI14"] <= params["rsi_high"]
     )
+    if not base:
+        return False
+
+    if params.get("require_contraction"):
+        r10, r60 = row.get("Range10"), row.get("Range10Avg60")
+        if pd.isna(r10) or pd.isna(r60):
+            return False
+        if r10 > r60 * params.get("contraction_threshold", 0.75):
+            return False  # range isn't tight enough -- not a real squeeze
+
+    if params.get("require_rs"):
+        rs_diff = row.get("RS_Diff")
+        if pd.isna(rs_diff) or rs_diff <= 0:
+            return False  # stock hasn't been outperforming Nifty
+
+    return True
 
 # ----------------------------------------------------------------------------------
 # BACKTEST
@@ -102,9 +152,7 @@ def backtest_symbol(df: pd.DataFrame, market_regime: pd.Series, params: dict) ->
         date = row["Date"]
         mkt_ok = bool(market_regime.get(date, True))
 
-        if pd.notna(row.get("SMA200")) and signal_condition(
-            row, mkt_ok, params["volume_mult"], params["rsi_low"], params["rsi_high"]
-        ):
+        if pd.notna(row.get("SMA200")) and signal_condition(row, mkt_ok, params):
             entry_day = df.iloc[i + 1]
             entry_price = entry_day["Open"] * (1 + params["friction_pct"])
             atr = row["ATR14"]
@@ -164,9 +212,7 @@ def backtest_symbol_trailing(df: pd.DataFrame, market_regime: pd.Series, params:
         date = row["Date"]
         mkt_ok = bool(market_regime.get(date, True))
 
-        if pd.notna(row.get("SMA200")) and signal_condition(
-            row, mkt_ok, params["volume_mult"], params["rsi_low"], params["rsi_high"]
-        ):
+        if pd.notna(row.get("SMA200")) and signal_condition(row, mkt_ok, params):
             entry_day = df.iloc[i + 1]
             entry_price = entry_day["Open"] * (1 + params["friction_pct"])
             atr_entry = row["ATR14"]
@@ -218,6 +264,7 @@ def backtest_symbol_trailing(df: pd.DataFrame, market_regime: pd.Series, params:
 def run_backtest(universe, years, params) -> tuple[pd.DataFrame, dict]:
     start = (datetime.now() - timedelta(days=365 * years + 250)).strftime("%Y-%m-%d")
     market_regime = get_market_regime(start)
+    nifty_close = get_nifty_close(start)
     data = yf.download(universe, start=start, group_by="ticker", auto_adjust=True,
                         progress=False, threads=True)
 
@@ -230,6 +277,7 @@ def run_backtest(universe, years, params) -> tuple[pd.DataFrame, dict]:
             if len(df) < 210:
                 continue
             df = compute_indicators(df)
+            df = add_relative_strength(df, nifty_close, params.get("rs_lookback", 63))
             trades = backtest_fn(df, market_regime, params)
             for t in trades:
                 t["symbol"] = sym.replace(".NS", "")
@@ -268,6 +316,7 @@ def screen_today(universe, capital, risk_pct, params) -> tuple[pd.DataFrame, boo
 
     data = yf.download(universe, start=start, group_by="ticker", auto_adjust=True,
                         progress=False, threads=True)
+    nifty_close = get_nifty_close(start)
     max_risk_amount = capital * risk_pct
 
     rows = []
@@ -277,10 +326,9 @@ def screen_today(universe, capital, risk_pct, params) -> tuple[pd.DataFrame, boo
             if len(df) < 210:
                 continue
             df = compute_indicators(df)
+            df = add_relative_strength(df, nifty_close, params.get("rs_lookback", 63))
             last = df.iloc[-1]
-            if pd.notna(last.get("SMA200")) and signal_condition(
-                last, is_bullish, params["volume_mult"], params["rsi_low"], params["rsi_high"]
-            ):
+            if pd.notna(last.get("SMA200")) and signal_condition(last, is_bullish, params):
                 atr = last["ATR14"]
                 entry = last["Close"]
                 stop = entry - params["atr_stop_mult"] * atr
