@@ -36,7 +36,9 @@ Strategy, current version:
     - Real earnings growth: latest quarterly YoY earnings growth exceeds a
       minimum threshold (the "C" in CANSLIM -- Current earnings growth)
 
-  WEIGHTED SCORE (each worth 2 of 10 points; take the trade if score >= threshold):
+  WEIGHTED SCORE (each worth 2 of 8 points -- NOT 10; regime/breakout/RSI are
+  separate gates above and don't add to this total. Take the trade if score
+  >= threshold):
     - Stock trend alignment: Close > SMA50 > SMA200
     - Relative strength vs Nifty: stock's 63-day return beats Nifty's by a
       real margin
@@ -98,7 +100,7 @@ DEFAULT_PARAMS = dict(
     runner_trail_mult=2.0,
     hold_days=20,
     friction_pct=0.0015,
-    score_threshold=7,
+    score_threshold=6,   # out of 8 (see setup_score) -- 3 of 4 factors, not all 4
     rsi_low=45, rsi_high=70,
     min_earnings_growth=0.10,   # live screener only -- 10% YoY quarterly earnings growth
 
@@ -431,7 +433,7 @@ def screen_today(universe, capital, risk_pct, params) -> tuple[pd.DataFrame, boo
                     "Risk %": round(risk_per_share / entry * 100, 2),
                     "Earnings Growth YoY": f"{earnings_growth*100:.1f}%",
                     "_score_num": score,
-                    "Setup Score": f"{score}/10",
+                    "Setup Score": f"{score}/8",
                     "RSI14": round(last["RSI14"], 1),
                 })
         except Exception:
