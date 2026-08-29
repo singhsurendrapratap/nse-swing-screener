@@ -45,6 +45,10 @@ DEFAULT_UNIVERSE = [
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    # Guard: yfinance sometimes returns a partial/incomplete bar for "today" if
+    # fetched while the market is open, or a stale row with NaN OHLC. Drop any
+    # such rows so they can't corrupt a signal or an exit calculation.
+    df = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
     df["SMA50"] = df["Close"].rolling(50).mean()
     df["SMA200"] = df["Close"].rolling(200).mean()
     df["High20"] = df["High"].rolling(20).max().shift(1)
@@ -142,11 +146,76 @@ def backtest_symbol(df: pd.DataFrame, market_regime: pd.Series, params: dict) ->
     return trades
 
 
+def backtest_symbol_trailing(df: pd.DataFrame, market_regime: pd.Series, params: dict) -> list:
+    """
+    Same entry rules as backtest_symbol, but exits differ: no fixed target.
+    Instead, the stop trails behind the highest close seen since entry,
+    always ATR-adjusted and only ever moving up. Exit only when price
+    falls back and hits that trailing stop, or the max hold cap is reached.
+    """
+    trades = []
+    df = df.reset_index()
+    i = 0
+    while i < len(df) - 2:
+        row = df.iloc[i]
+        date = row["Date"]
+        mkt_ok = bool(market_regime.get(date, True))
+
+        if pd.notna(row.get("SMA200")) and signal_condition(
+            row, mkt_ok, params["volume_mult"], params["rsi_low"], params["rsi_high"]
+        ):
+            entry_day = df.iloc[i + 1]
+            entry_price = entry_day["Open"] * (1 + params["friction_pct"])
+            atr_entry = row["ATR14"]
+            if pd.isna(atr_entry) or atr_entry <= 0:
+                i += 1
+                continue
+
+            initial_stop = entry_price - params["atr_stop_mult"] * atr_entry
+            stop = initial_stop
+            highest_close = entry_price
+
+            outcome, exit_price, days_held = None, None, 0
+            for j in range(i + 1, min(i + 1 + params["hold_days"], len(df))):
+                day = df.iloc[j]
+                days_held += 1
+                if day["Low"] <= stop:
+                    outcome = "win" if stop > entry_price else "loss"
+                    exit_price = stop * (1 - params["friction_pct"])
+                    break
+                highest_close = max(highest_close, day["Close"])
+                day_atr = day["ATR14"] if pd.notna(day["ATR14"]) else atr_entry
+                trail_candidate = highest_close - params["atr_stop_mult"] * day_atr
+                stop = max(stop, trail_candidate)  # ratchet up only, never down
+
+            if outcome is None:
+                exit_price = df.iloc[min(i + params["hold_days"], len(df) - 1)]["Close"] * (1 - params["friction_pct"])
+                outcome = "win" if exit_price > entry_price else "loss"
+
+            risk_per_share = entry_price - initial_stop
+            r_multiple = (exit_price - entry_price) / risk_per_share if risk_per_share > 0 else 0
+
+            trades.append({
+                "symbol": None,
+                "entry_date": entry_day["Date"],
+                "outcome": outcome,
+                "r_multiple": r_multiple,
+                "pct_return": (exit_price - entry_price) / entry_price * 100,
+                "days_held": days_held,
+            })
+            i += params["hold_days"]
+        else:
+            i += 1
+    return trades
+
+
 def run_backtest(universe, years, params) -> tuple[pd.DataFrame, dict]:
     start = (datetime.now() - timedelta(days=365 * years + 250)).strftime("%Y-%m-%d")
     market_regime = get_market_regime(start)
     data = yf.download(universe, start=start, group_by="ticker", auto_adjust=True,
                         progress=False, threads=True)
+
+    backtest_fn = backtest_symbol_trailing if params.get("use_trailing_stop") else backtest_symbol
 
     all_trades = []
     for sym in universe:
@@ -155,7 +224,7 @@ def run_backtest(universe, years, params) -> tuple[pd.DataFrame, dict]:
             if len(df) < 210:
                 continue
             df = compute_indicators(df)
-            trades = backtest_symbol(df, market_regime, params)
+            trades = backtest_fn(df, market_regime, params)
             for t in trades:
                 t["symbol"] = sym.replace(".NS", "")
             all_trades.extend(trades)
@@ -208,19 +277,21 @@ def screen_today(universe, capital, risk_pct, params) -> tuple[pd.DataFrame, boo
                 atr = last["ATR14"]
                 entry = last["Close"]
                 stop = entry - params["atr_stop_mult"] * atr
-                target = entry + params["atr_target_mult"] * atr
                 risk_per_share = entry - stop
                 shares = int(max_risk_amount // risk_per_share) if risk_per_share > 0 else 0
+                use_trail = params.get("use_trailing_stop", False)
+                target_val = "Trail stop, no fixed target" if use_trail else round(entry + params["atr_target_mult"] * atr, 2)
+                rr_val = "n/a (trailing)" if use_trail else round(params["atr_target_mult"] / params["atr_stop_mult"], 2)
 
                 rows.append({
                     "Symbol": sym.replace(".NS", ""),
                     "Buy Near": round(entry, 2),
-                    "Stop-Loss (Sell)": round(stop, 2),
-                    "Target (Sell)": round(target, 2),
+                    "Initial Stop-Loss": round(stop, 2),
+                    "Target (Sell)": target_val,
                     "Qty (at your risk budget)": shares,
                     "Capital Req (Rs)": round(shares * entry, 2),
                     "Risk %": round(risk_per_share / entry * 100, 2),
-                    "Reward:Risk": round((target - entry) / risk_per_share, 2) if risk_per_share else 0,
+                    "Reward:Risk": rr_val,
                     "Vol Surge x": round(last["Volume"] / last["VolAvg20"], 2),
                     "RSI14": round(last["RSI14"], 1),
                 })
