@@ -70,7 +70,11 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # Volatility contraction (VCP-lite): is the recent 10-day trading range
     # tighter than its own typical 60-day range? A genuine squeeze before a
     # breakout (institutional accumulation) vs. a random spike out of nowhere.
-    df["Range10"] = (df["High"].rolling(10).max() - df["Low"].rolling(10).min()) / df["Close"]
+    # FIX: shift(1) so this measures the range BEFORE today, excluding the
+    # breakout day itself (which is expansive by definition -- including it
+    # was contradicting the very thing this filter is supposed to require).
+    range10_raw = df["High"].rolling(10).max() - df["Low"].rolling(10).min()
+    df["Range10"] = (range10_raw / df["Close"]).shift(1)
     df["Range10Avg60"] = df["Range10"].rolling(60).mean()
 
     return df
