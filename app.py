@@ -58,6 +58,31 @@ with st.sidebar:
     hold_days = st.slider("Max hold (trading days)", 5, 40, 15)
     friction_pct = st.slider("Friction: brokerage+STT+slippage (%)", 0.0, 0.5, 0.15, 0.05) / 100
     st.divider()
+    st.subheader("Entry quality filters (new)")
+    require_contraction = st.checkbox(
+        "Require volatility contraction before breakout",
+        value=True,
+        help="Only take breakouts where the stock was tightening into a narrower "
+             "range beforehand (VCP-style squeeze), not a random spike. Aims to "
+             "cut down false/whipsaw breakouts.",
+    )
+    contraction_threshold = st.slider(
+        "Contraction strictness", 0.5, 1.0, 0.75, 0.05,
+        disabled=not require_contraction,
+        help="Lower = stricter squeeze required (current 10-day range must be "
+             "tighter than this fraction of its own 60-day average range).",
+    )
+    require_rs = st.checkbox(
+        "Require relative strength vs Nifty",
+        value=True,
+        help="Only take breakouts in stocks that have been outperforming the "
+             "Nifty 50 over the lookback window, not just moving with the market.",
+    )
+    rs_lookback = st.slider(
+        "Relative strength lookback (days)", 20, 120, 63, 1,
+        disabled=not require_rs,
+    )
+    st.divider()
     universe = st.multiselect("Universe (NSE tickers)", DEFAULT_UNIVERSE, default=DEFAULT_UNIVERSE)
     backtest_years = st.slider("Backtest lookback (years)", 1, 5, 3)
 
@@ -66,6 +91,8 @@ params = dict(
     atr_stop_mult=atr_stop, atr_target_mult=atr_target,
     hold_days=hold_days, friction_pct=friction_pct,
     use_trailing_stop=use_trailing_stop,
+    require_contraction=require_contraction, contraction_threshold=contraction_threshold,
+    require_rs=require_rs, rs_lookback=rs_lookback,
 )
 
 tab1, tab2, tab3 = st.tabs(["🎯 Today's Watchlist", "📊 Backtest", "📌 My Positions"])
@@ -127,7 +154,13 @@ with tab2:
         if not summary:
             st.info("No trades generated in this period with these settings.")
         else:
-            st.caption(f"**These results were generated using: {summary['mode']}**")
+            filters_on = []
+            if params.get("require_contraction"):
+                filters_on.append("Volatility Contraction")
+            if params.get("require_rs"):
+                filters_on.append("Relative Strength")
+            filters_label = " + ".join(filters_on) if filters_on else "None"
+            st.caption(f"**These results were generated using: {summary['mode']} | Entry filters: {filters_label}**")
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Total trades", summary["total_trades"])
             c2.metric("Win rate", f"{summary['win_rate']:.1f}%")
