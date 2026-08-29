@@ -47,7 +47,14 @@ with st.sidebar:
     volume_mult = st.slider("Breakout volume multiple", 1.0, 3.0, 1.5, 0.1)
     rsi_low, rsi_high = st.slider("RSI band", 0, 100, (45, 70))
     atr_stop = st.slider("Stop-loss (x ATR)", 0.5, 3.0, 1.5, 0.1)
-    atr_target = st.slider("Target (x ATR)", 1.0, 6.0, 3.0, 0.1)
+    use_trailing_stop = st.checkbox(
+        "Use trailing stop instead of fixed target",
+        value=False,
+        help="Instead of exiting at a fixed 2:1/3:1 target, let the stop ratchet up "
+             "behind the price and only exit when it's hit. Lets winners run further, "
+             "at the cost of a less predictable exit price.",
+    )
+    atr_target = st.slider("Target (x ATR)", 1.0, 6.0, 3.0, 0.1, disabled=use_trailing_stop)
     hold_days = st.slider("Max hold (trading days)", 5, 40, 15)
     friction_pct = st.slider("Friction: brokerage+STT+slippage (%)", 0.0, 0.5, 0.15, 0.05) / 100
     st.divider()
@@ -58,6 +65,7 @@ params = dict(
     volume_mult=volume_mult, rsi_low=rsi_low, rsi_high=rsi_high,
     atr_stop_mult=atr_stop, atr_target_mult=atr_target,
     hold_days=hold_days, friction_pct=friction_pct,
+    use_trailing_stop=use_trailing_stop,
 )
 
 tab1, tab2, tab3 = st.tabs(["🎯 Today's Watchlist", "📊 Backtest", "📌 My Positions"])
@@ -212,4 +220,5 @@ st.caption(
     "results. Always size positions to a risk % you can afford to lose repeatedly. "
     "Note: on free cloud hosting, the positions file may reset if the app restarts/redeploys -- "
     "download a backup periodically if that matters to you."
-)
+    )
+    
