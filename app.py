@@ -112,6 +112,10 @@ with tab1:
 # ---------------------------------------------------------------------------
 with tab2:
     st.subheader("Historical performance of this exact strategy")
+    if params["use_trailing_stop"]:
+        st.success("🟢 Mode: **TRAILING STOP** (no fixed target — stop ratchets up behind price)")
+    else:
+        st.info("🔵 Mode: **FIXED TARGET** (exits at a fixed 3x-ATR target)")
     st.write(
         "Runs the same rules over the past N years so you can see the real win rate and "
         "expectancy before trusting today's picks."
@@ -123,6 +127,7 @@ with tab2:
         if not summary:
             st.info("No trades generated in this period with these settings.")
         else:
+            st.caption(f"**These results were generated using: {summary['mode']}**")
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Total trades", summary["total_trades"])
             c2.metric("Win rate", f"{summary['win_rate']:.1f}%")
@@ -220,5 +225,4 @@ st.caption(
     "results. Always size positions to a risk % you can afford to lose repeatedly. "
     "Note: on free cloud hosting, the positions file may reset if the app restarts/redeploys -- "
     "download a backup periodically if that matters to you."
-    )
-    
+)
