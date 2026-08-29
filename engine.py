@@ -116,9 +116,11 @@ def backtest_symbol(df: pd.DataFrame, market_regime: pd.Series, params: dict) ->
             target = entry_price + params["atr_target_mult"] * atr
 
             outcome, exit_price, days_held = None, None, 0
+            exit_index = i + 1
             for j in range(i + 1, min(i + 1 + params["hold_days"], len(df))):
                 day = df.iloc[j]
                 days_held += 1
+                exit_index = j
                 if day["Low"] <= stop:
                     outcome, exit_price = "loss", stop * (1 - params["friction_pct"])
                     break
@@ -126,7 +128,8 @@ def backtest_symbol(df: pd.DataFrame, market_regime: pd.Series, params: dict) ->
                     outcome, exit_price = "win", target * (1 - params["friction_pct"])
                     break
             if outcome is None:
-                exit_price = df.iloc[min(i + params["hold_days"], len(df) - 1)]["Close"] * (1 - params["friction_pct"])
+                exit_index = min(i + params["hold_days"], len(df) - 1)
+                exit_price = df.iloc[exit_index]["Close"] * (1 - params["friction_pct"])
                 outcome = "win" if exit_price > entry_price else "loss"
 
             risk_per_share = entry_price - stop  # FIX: consistent with actual stop used
@@ -140,7 +143,7 @@ def backtest_symbol(df: pd.DataFrame, market_regime: pd.Series, params: dict) ->
                 "pct_return": (exit_price - entry_price) / entry_price * 100,
                 "days_held": days_held,
             })
-            i += params["hold_days"]
+            i = exit_index + 1  # FIX: resume right after THIS trade closes, not after the max-hold cap
         else:
             i += 1
     return trades
@@ -176,9 +179,11 @@ def backtest_symbol_trailing(df: pd.DataFrame, market_regime: pd.Series, params:
             highest_close = entry_price
 
             outcome, exit_price, days_held = None, None, 0
+            exit_index = i + 1
             for j in range(i + 1, min(i + 1 + params["hold_days"], len(df))):
                 day = df.iloc[j]
                 days_held += 1
+                exit_index = j
                 if day["Low"] <= stop:
                     outcome = "win" if stop > entry_price else "loss"
                     exit_price = stop * (1 - params["friction_pct"])
@@ -189,7 +194,8 @@ def backtest_symbol_trailing(df: pd.DataFrame, market_regime: pd.Series, params:
                 stop = max(stop, trail_candidate)  # ratchet up only, never down
 
             if outcome is None:
-                exit_price = df.iloc[min(i + params["hold_days"], len(df) - 1)]["Close"] * (1 - params["friction_pct"])
+                exit_index = min(i + params["hold_days"], len(df) - 1)
+                exit_price = df.iloc[exit_index]["Close"] * (1 - params["friction_pct"])
                 outcome = "win" if exit_price > entry_price else "loss"
 
             risk_per_share = entry_price - initial_stop
@@ -203,7 +209,7 @@ def backtest_symbol_trailing(df: pd.DataFrame, market_regime: pd.Series, params:
                 "pct_return": (exit_price - entry_price) / entry_price * 100,
                 "days_held": days_held,
             })
-            i += params["hold_days"]
+            i = exit_index + 1  # FIX: resume right after THIS trade closes, not after the max-hold cap
         else:
             i += 1
     return trades
