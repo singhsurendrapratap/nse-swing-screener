@@ -1,47 +1,6 @@
 """
 engine.py -- core strategy logic (trend + breakout + weighted setup score)
 Shared by both the CLI script and the Streamlit web app.
-
-WHERE THIS DESIGN CAME FROM (so future changes stay grounded, not vibes):
-  - We backtested strict-AND filtering (contraction AND relative-strength both
-    required) and watched trade count collapse from 162 to 6 with no proven
-    quality gain -- AND-of-everything is just brutal on sample size. Fixed by
-    switching to a WEIGHTED SCORE: several quality signals each contribute
-    points, and you act once enough of them line up, not only when all of
-    them do.
-  - We tested fixed-target, pure-trailing, and pure-scaled exits across many
-    runs; all landed in the same -0.12R to +0.02R band -- statistically
-    indistinguishable from each other. The exit mechanics were NOT the
-    bottleneck; that's why this version ships ONE well-reasoned exit (layered:
-    breakeven-early + partial profit + trail the rest) instead of three modes
-    to keep re-testing.
-  - We found and fixed two real lookahead-bias bugs along the way (a
-    contraction filter that measured the breakout day's own range instead of
-    the days BEFORE it; a backtest loop that skipped too far forward after a
-    trade closed). Every rolling window here that's meant to describe
-    "before today" is explicitly .shift(1)'d -- don't remove those shifts.
-
-Strategy, current version:
-  MANDATORY GATES (must all be true, or there's no trade to score):
-    - Index regime: Nifty Close > its own 20-EMA > its own 50-SMA (a real
-      uptrend, not just "above one average")
-    - Breakout: stock closes above its prior 20-day high
-    - RSI sanity band: not deeply oversold, not blown-off overbought
-
-  WEIGHTED SCORE (each worth 2 of 10 points; take the trade if score >= threshold):
-    - Stock trend alignment: Close > SMA50 > SMA200
-    - Relative strength vs Nifty: stock's 63-day return beats Nifty's by a
-      real margin (not just barely positive)
-    - Volatility contraction: ATR5/ATR20 tight AND recent volume dried up,
-      both measured through YESTERDAY, excluding the breakout day itself
-    - Volume expansion: today's volume much higher than its 20-day average
-
-  EXIT (layered, one method):
-    - Initial stop: entry - 1.5x ATR
-    - At +1.5x ATR: move stop to breakeven (locks in "can't lose" early)
-    - At +2.5x ATR: sell 50% of the position, banking real profit
-    - Remaining 50% trails behind price using the tighter (more protective)
-      of a 20-day structural low or a 2.0x ATR volatility trail
 """
 
 import pandas as pd
@@ -64,11 +23,6 @@ DEFAULT_UNIVERSE = [
     "TATACONSUM.NS",
 ]
 
-# Representative sample of liquid, established mid/small-caps -- NOT the official
-# index list (too many for casual backtesting; many recent IPOs lack history).
-# CAVEAT: testing today's known survivors against past years has survivorship
-# bias baked in. Treat results here as more optimistic than a true point-in-time
-# backtest. Not the default -- pick it deliberately in the sidebar if you want it.
 MIDSMALLCAP_UNIVERSE = [
     "FEDERALBNK.NS", "MCX.NS", "SUZLON.NS", "BHEL.NS", "LAURUSLABS.NS", "POLYCAB.NS",
     "ABCAPITAL.NS", "INDIANB.NS", "PAGEIND.NS", "MPHASIS.NS", "PERSISTENT.NS",
@@ -93,24 +47,22 @@ DEFAULT_PARAMS = dict(
     friction_pct=0.0015,
     score_threshold=7,
     rs_lookback=63,
-    rs_min_outperformance=0.05,   # stock must beat Nifty by >= 5 percentage points
-    contraction_ratio_threshold=0.70,  # ATR5/ATR20 must be tighter than this
+    rs_min_outperformance=0.05,
+    contraction_ratio_threshold=0.70,
 )
 
 # ----------------------------------------------------------------------------------
-# INDICATORS
+# INDICATORS & MARKET REGIME
 # ----------------------------------------------------------------------------------
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    # Guard: yfinance sometimes returns a partial/incomplete bar for "today" if
-    # fetched while the market is open, or a stale row with NaN OHLC.
     df = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
 
     df["SMA50"] = df["Close"].rolling(50).mean()
     df["SMA200"] = df["Close"].rolling(200).mean()
-    df["High20"] = df["High"].rolling(20).max().shift(1)      # prior 20d high, excludes today
-    df["Low20"] = df["Low"].rolling(20).min().shift(1)        # prior 20d low, excludes today
+    df["High20"] = df["High"].rolling(20).max().shift(1)
+    df["Low20"] = df["Low"].rolling(20).min().shift(1)
     df["VolAvg20"] = df["Volume"].rolling(20).mean().shift(1)
 
     delta = df["Close"].diff()
@@ -126,9 +78,6 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     ], axis=1).max(axis=1)
     df["ATR14"] = tr.rolling(14).mean()
 
-    # VCP-style contraction: ATR5/ATR20 ratio AND 5-day volume vs 20-day average,
-    # both measured through YESTERDAY (shift(1)) so the breakout day's own
-    # expansion can't contaminate the "was it quiet beforehand" measurement.
     atr5_raw = tr.rolling(5).mean()
     atr20_raw = tr.rolling(20).mean()
     df["ATR_ContractionRatio"] = (atr5_raw / atr20_raw).shift(1)
@@ -142,14 +91,16 @@ def get_nifty_data(start_date: str) -> pd.DataFrame:
     if nifty.empty:
         return pd.DataFrame()
     if isinstance(nifty.columns, pd.MultiIndex):
-        nifty = nifty.xs(BENCHMARK_TICKER, level=1, axis=1)
+        if BENCHMARK_TICKER in nifty.columns.levels[0]:
+            nifty = nifty[BENCHMARK_TICKER]
+        else:
+            nifty.columns = nifty.columns.get_level_values(0)
     nifty["EMA20"] = nifty["Close"].ewm(span=20, adjust=False).mean()
     nifty["SMA50"] = nifty["Close"].rolling(50).mean()
     return nifty
 
 
 def get_market_regime(nifty_df: pd.DataFrame) -> pd.Series:
-    """True only when Nifty is in a real uptrend: Close > 20-EMA > 50-SMA."""
     if nifty_df.empty:
         return pd.Series(dtype=bool)
     cond = (nifty_df["Close"] > nifty_df["EMA20"]) & (nifty_df["EMA20"] > nifty_df["SMA50"])
@@ -157,10 +108,6 @@ def get_market_regime(nifty_df: pd.DataFrame) -> pd.Series:
 
 
 def add_relative_strength(df: pd.DataFrame, nifty_close: pd.Series, lookback: int) -> pd.DataFrame:
-    """RS_Diff = stock's % return over `lookback` days minus Nifty's % return
-    over the same window. A real margin, not a ratio (ratios break when either
-    return is negative -- e.g. a stock down 5% vs Nifty down 20% is a big
-    relative WIN, but the ratio 0.25 looks like a loser)."""
     df = df.copy()
     if nifty_close.empty:
         df["RS_Diff"] = np.nan
@@ -170,12 +117,10 @@ def add_relative_strength(df: pd.DataFrame, nifty_close: pd.Series, lookback: in
     return df
 
 # ----------------------------------------------------------------------------------
-# ENTRY SIGNAL: mandatory gates + weighted score
+# ENTRY SIGNAL & SCORING
 # ----------------------------------------------------------------------------------
 
 def setup_score(row, market_ok: bool, params: dict) -> int:
-    """Returns -1 if a mandatory gate fails (never a valid setup that day),
-    otherwise 2-10 reflecting how many quality factors lined up."""
     breakout_ok = (
         row["Close"] > row["High20"]
         and params["rsi_low"] <= row["RSI14"] <= params["rsi_high"]
@@ -186,21 +131,21 @@ def setup_score(row, market_ok: bool, params: dict) -> int:
     score = 0
 
     if row["Close"] > row["SMA50"] > row["SMA200"]:
-        score += 2  # trend alignment
+        score += 2
 
     rs_diff = row.get("RS_Diff")
     if pd.notna(rs_diff) and rs_diff > params.get("rs_min_outperformance", 0.05):
-        score += 2  # meaningful relative strength vs Nifty
+        score += 2
 
     ratio = row.get("ATR_ContractionRatio")
     vol5 = row.get("Vol5Avg")
     vol20 = row.get("VolAvg20")
     if pd.notna(ratio) and pd.notna(vol5) and pd.notna(vol20):
         if ratio < params.get("contraction_ratio_threshold", 0.70) and vol5 < vol20:
-            score += 2  # price AND volume both dried up before the breakout
+            score += 2
 
     if row["Volume"] >= params["volume_mult"] * row["VolAvg20"]:
-        score += 2  # volume expansion on the breakout day itself
+        score += 2
 
     return score
 
@@ -209,15 +154,10 @@ def entry_signal(row, market_ok: bool, params: dict) -> bool:
     return setup_score(row, market_ok, params) >= params.get("score_threshold", 7)
 
 # ----------------------------------------------------------------------------------
-# LAYERED EXIT SIMULATION (used by both backtest and live position tracking)
+# EXIT SIMULATION
 # ----------------------------------------------------------------------------------
 
 def simulate_layered_exit(df: pd.DataFrame, i: int, entry_price: float, atr_entry: float, params: dict):
-    """
-    df is the reset-index'd, per-symbol frame; i is the signal-day row index
-    (entry happens at df.iloc[i+1]'s open, already priced into entry_price).
-    Returns (r_multiple, days_held, exit_index).
-    """
     fric = params["friction_pct"]
     initial_stop = entry_price - params["atr_stop_mult"] * atr_entry
     stop = initial_stop
@@ -244,7 +184,7 @@ def simulate_layered_exit(df: pd.DataFrame, i: int, entry_price: float, atr_entr
                 r_multiple = (exit_price - entry_price) / (entry_price - initial_stop)
                 break
             if day["High"] >= breakeven_trigger:
-                stop = max(stop, entry_price)  # lock in "can't lose" early
+                stop = max(stop, entry_price)
             if day["High"] >= partial_trigger:
                 partial_taken = True
                 partial_exit = partial_trigger * (1 - fric)
@@ -260,7 +200,7 @@ def simulate_layered_exit(df: pd.DataFrame, i: int, entry_price: float, atr_entr
             highest_close = max(highest_close, day["Close"])
             atr_trail = highest_close - runner_trail_mult * day_atr
             structural_trail = day["Low20"] if pd.notna(day.get("Low20")) else atr_trail
-            stop = max(stop, atr_trail, structural_trail)  # tighter (higher) of the two
+            stop = max(stop, atr_trail, structural_trail)
 
     if r_multiple is None:
         exit_index = min(i + params["hold_days"], len(df) - 1)
@@ -300,7 +240,7 @@ def backtest_symbol(df: pd.DataFrame, market_regime: pd.Series, params: dict) ->
                 "days_held": days_held,
                 "setup_score": setup_score(row, mkt_ok, params),
             })
-            i = exit_index + 1  # resume right after THIS trade closes
+            i = exit_index + 1
         else:
             i += 1
     return trades
@@ -312,13 +252,18 @@ def run_backtest(universe, years, params) -> tuple[pd.DataFrame, dict]:
     market_regime = get_market_regime(nifty_df)
     nifty_close = nifty_df["Close"] if not nifty_df.empty else pd.Series(dtype=float)
 
-    data = yf.download(universe, start=start, group_by="ticker", auto_adjust=True,
-                        progress=False, threads=True)
+    data = yf.download(universe, start=start, group_by="ticker", auto_adjust=True, progress=False, threads=True)
 
     all_trades = []
     for sym in universe:
         try:
-            df = data[sym].dropna(how="all")
+            if isinstance(data.columns, pd.MultiIndex):
+                if sym not in data.columns.levels[0]:
+                    continue
+                df = data[sym].dropna(how="all")
+            else:
+                df = data.dropna(how="all")
+
             if len(df) < 210:
                 continue
             df = compute_indicators(df)
@@ -347,7 +292,7 @@ def run_backtest(universe, years, params) -> tuple[pd.DataFrame, dict]:
     return trades_df, summary
 
 # ----------------------------------------------------------------------------------
-# TODAY'S SCREENER
+# SCREEN TODAY
 # ----------------------------------------------------------------------------------
 
 def screen_today(universe, capital, risk_pct, params) -> tuple[pd.DataFrame, bool]:
@@ -360,14 +305,19 @@ def screen_today(universe, capital, risk_pct, params) -> tuple[pd.DataFrame, boo
     if not is_bullish:
         return pd.DataFrame(), False
 
-    data = yf.download(universe, start=start, group_by="ticker", auto_adjust=True,
-                        progress=False, threads=True)
+    data = yf.download(universe, start=start, group_by="ticker", auto_adjust=True, progress=False, threads=True)
     max_risk_amount = capital * risk_pct
 
     rows = []
     for sym in universe:
         try:
-            df = data[sym].dropna(how="all")
+            if isinstance(data.columns, pd.MultiIndex):
+                if sym not in data.columns.levels[0]:
+                    continue
+                df = data[sym].dropna(how="all")
+            else:
+                df = data.dropna(how="all")
+
             if len(df) < 210:
                 continue
             df = compute_indicators(df)
@@ -408,30 +358,30 @@ def screen_today(universe, capital, risk_pct, params) -> tuple[pd.DataFrame, boo
     return watchlist, True
 
 # ----------------------------------------------------------------------------------
-# OPEN POSITION TRACKING -- sell/exit signals for stocks you already bought
+# POSITION EVALUATION
 # ----------------------------------------------------------------------------------
 
 def evaluate_positions(positions: pd.DataFrame, params: dict) -> pd.DataFrame:
-    """
-    positions columns required: Symbol, Entry Date, Entry Price, Qty, Stop, Target
-    (Target here is treated as the user's own reference/partial-target level --
-    this function reports live status, it doesn't re-simulate the layered exit.)
-    """
     if positions.empty:
         return positions
 
     symbols = [s if s.endswith(".NS") else f"{s}.NS" for s in positions["Symbol"]]
     start = (datetime.now() - timedelta(days=400)).strftime("%Y-%m-%d")
-    data = yf.download(symbols, start=start, group_by="ticker", auto_adjust=True,
-                        progress=False, threads=True)
+    data = yf.download(symbols, start=start, group_by="ticker", auto_adjust=True, progress=False, threads=True)
 
     out_rows = []
     for _, pos in positions.iterrows():
         sym = str(pos["Symbol"])
         yf_sym = sym if sym.endswith(".NS") else f"{sym}.NS"
         try:
-            df = data[yf_sym] if len(symbols) > 1 else data
-            df = df.dropna(how="all")
+            if isinstance(data.columns, pd.MultiIndex):
+                if yf_sym in data.columns.levels[0]:
+                    df = data[yf_sym].dropna(how="all")
+                else:
+                    df = data.dropna(how="all")
+            else:
+                df = data.dropna(how="all")
+
             df = compute_indicators(df)
             last = df.iloc[-1]
 
