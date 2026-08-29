@@ -244,6 +244,7 @@ def run_backtest(universe, years, params) -> tuple[pd.DataFrame, dict]:
         "avg_loss_r": losses.r_multiple.mean() if len(losses) else 0,
         "expectancy_r": trades_df.r_multiple.mean(),
         "avg_days_held": trades_df.days_held.mean(),
+        "mode": "TRAILING STOP" if params.get("use_trailing_stop") else "FIXED TARGET",
     }
     return trades_df, summary
 
