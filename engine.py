@@ -15,7 +15,14 @@ Important:
   historical backtest because yfinance does not provide reliable point-in-time
   historical earnings growth in this workflow.
 - This is a research tool, not investment advice.
+
+DEPLOYMENT: replace the ENTIRE contents of your repo's engine.py with this
+file's contents (same for app.py). After several mismatched-deploy incidents
+this session, ENGINE_VERSION below exists specifically so you can confirm a
+redeploy actually took -- check the sidebar footer against this string.
 """
+
+ENGINE_VERSION = "engine-2026-08-30-a"
 
 import pandas as pd
 import numpy as np
