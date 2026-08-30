@@ -215,18 +215,21 @@ with tab2:
 
             if not summary:
                 st.info("No trades passed the filters in this period.")
-            else:
+                        else:
                 c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Trades", summary.get("total_trades", 0))
-c2.metric("Win rate", f"{summary.get('win_rate', 0.0):.1f}%")
-c3.metric("Expectancy", f"{summary.get('expectancy_r', 0.0):.2f}R")
+                c1.metric("Trades", summary.get("total_trades", 0))
+                c2.metric("Win rate", f"{summary.get('win_rate', 0.0):.1f}%")
+                c3.metric("Expectancy", f"{summary.get('expectancy_r', 0.0):.2f}R")
 
-pf = summary.get("profit_factor", 0.0)
-c4.metric("Profit factor", f"{pf:.2f}" if isinstance(pf, (int, float)) else str(pf))
+                pf = summary.get("profit_factor", 0.0)
+                c4.metric("Profit factor", f"{pf:.2f}" if isinstance(pf, (int, float)) else str(pf))
 
-c5.metric("Total R", f"{summary.get('total_r', 0.0):.2f}R")
+                c5.metric("Total R", f"{summary.get('total_r', 0.0):.2f}R")
 
-
+                c6, c7, c8 = st.columns(3)
+                c6.metric("Avg win", f"{summary.get('avg_win_r', 0.0):.2f}R")
+                c7.metric("Avg loss", f"{summary.get('avg_loss_r', 0.0):.2f}R")
+                c8.metric("Max losing streak", summary.get("max_loss_streak", 0))
                 c6, c7, c8 = st.columns(3)
                 c6.metric("Avg win", f"{summary['avg_win_r']:.2f}R")
                 c7.metric("Avg loss", f"{summary['avg_loss_r']:.2f}R")
