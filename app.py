@@ -49,11 +49,11 @@ with st.sidebar:
     st.divider()
     st.subheader("Setup score")
     score_threshold = st.slider(
-        "Minimum score required (out of 8)", 2, 8, DEFAULT_PARAMS["score_threshold"], 2,
-        help="Trend alignment, relative strength, volatility contraction, and volume "
-             "expansion each contribute 2 points -- 4 factors x 2 = 8 max. Market "
+        "Minimum score required (out of 10)", 1, 10, DEFAULT_PARAMS["score_threshold"], 1,
+        help="Trend alignment (2), relative strength (2), volume dry-up (2) + tight "
+             "range (1), and volume surge (2 or 3, tiered) = 10 max, verified. Market "
              "regime, breakout, and RSI band are separate mandatory gates, always "
-             "required regardless of score. 6 = need 3 of the 4 factors; 8 = need all 4.",
+             "required regardless of score.",
     )
     rsi_low, rsi_high = st.slider("RSI sanity band", 0, 100, (DEFAULT_PARAMS["rsi_low"], DEFAULT_PARAMS["rsi_high"]))
 
@@ -70,16 +70,24 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Exit (layered)")
-    atr_stop = st.slider("Initial stop-loss (x ATR)", 0.5, 3.0, DEFAULT_PARAMS["atr_stop_mult"], 0.1)
-    breakeven_mult = st.slider("Move to breakeven at (x ATR)", 0.5, 3.0, DEFAULT_PARAMS["breakeven_mult"], 0.1)
-    partial_target_mult = st.slider("Sell 50% at (x ATR)", 1.0, 5.0, DEFAULT_PARAMS["partial_target_mult"], 0.1)
-    if partial_target_mult <= breakeven_mult:
+    atr_stop = st.slider(
+        "Initial stop-loss (x ATR)", 0.5, 3.0, DEFAULT_PARAMS["atr_stop_mult"], 0.1,
+        help="This distance also defines '1R' -- everything below is measured "
+             "in multiples of this risk unit, not raw ATR.",
+    )
+    breakeven_r = st.slider("Move to breakeven at (+R)", 0.5, 3.0, DEFAULT_PARAMS["breakeven_r"], 0.1)
+    partial_r = st.slider("Sell 50% at (+R)", 1.0, 5.0, DEFAULT_PARAMS["partial_r"], 0.1)
+    if partial_r <= breakeven_r:
         st.error(
-            f"⚠️ 'Sell 50%' ({partial_target_mult}x) should be LARGER than "
-            f"'Move to breakeven' ({breakeven_mult}x), or the breakeven step "
+            f"⚠️ 'Sell 50%' ({partial_r}R) should be LARGER than "
+            f"'Move to breakeven' ({breakeven_r}R), or the breakeven step "
             "never gets a chance to act on its own. Adjust one of them."
         )
-    runner_trail_mult = st.slider("Trail the rest (x ATR)", 1.0, 4.0, DEFAULT_PARAMS["runner_trail_mult"], 0.1)
+    runner_trail_mult = st.slider(
+        "Trail the rest (x ATR, paired with 20-EMA)", 1.0, 4.0, DEFAULT_PARAMS["runner_trail_mult"], 0.1,
+        help="After the partial sell, the stop trails behind whichever is tighter: "
+             "this ATR multiple below the highest close, or the 20-day EMA.",
+    )
     with st.expander("More exit settings"):
         hold_days = st.slider("Max hold (trading days)", 5, 60, DEFAULT_PARAMS["hold_days"])
         friction_pct = st.slider("Friction: brokerage+STT+slippage (%)", 0.0, 0.5, 0.15, 0.05) / 100
@@ -105,8 +113,8 @@ with st.sidebar:
 params = dict(DEFAULT_PARAMS)  # start with fixed constants (volume_mult, rs_lookback, etc.)
 params.update(
     rsi_low=rsi_low, rsi_high=rsi_high,
-    atr_stop_mult=atr_stop, breakeven_mult=breakeven_mult,
-    partial_target_mult=partial_target_mult, runner_trail_mult=runner_trail_mult,
+    atr_stop_mult=atr_stop, breakeven_r=breakeven_r,
+    partial_r=partial_r, runner_trail_mult=runner_trail_mult,
     hold_days=hold_days, friction_pct=friction_pct,
     score_threshold=score_threshold,
     min_earnings_growth=min_earnings_growth,
@@ -122,7 +130,7 @@ with tab1:
     st.write(
         f"Screens the latest close for every stock in your universe, scores each "
         f"against the 4 weighted factors, and shows only those scoring "
-        f"**{score_threshold}/8 or higher** (plus the mandatory regime/breakout/RSI gates) "
+        f"**{score_threshold}/10 or higher** (plus the mandatory regime/breakout/RSI gates) "
         f"AND showing real earnings growth of at least **{min_earnings_growth*100:.0f}% YoY** "
         f"(CANSLIM-style -- price action alone isn't enough)."
     )
@@ -162,8 +170,8 @@ with tab1:
 with tab2:
     st.subheader("Historical performance of this exact strategy")
     st.caption(
-        f"Weighted score, needs **{score_threshold}/8** | Layered exit "
-        f"(breakeven @{breakeven_mult}x ATR, 50% @{partial_target_mult}x ATR, "
+        f"Weighted score, needs **{score_threshold}/10** | Layered exit "
+        f"(breakeven @{breakeven_r}R, 50% @{partial_r}R, "
         f"trail @{runner_trail_mult}x ATR) | Universe: {universe_choice}"
     )
     st.warning(
