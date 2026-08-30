@@ -215,7 +215,7 @@ with tab2:
 
             if not summary:
                 st.info("No trades passed the filters in this period.")
-                        else:
+            else:
                 c1, c2, c3, c4, c5 = st.columns(5)
                 c1.metric("Trades", summary.get("total_trades", 0))
                 c2.metric("Win rate", f"{summary.get('win_rate', 0.0):.1f}%")
@@ -230,14 +230,10 @@ with tab2:
                 c6.metric("Avg win", f"{summary.get('avg_win_r', 0.0):.2f}R")
                 c7.metric("Avg loss", f"{summary.get('avg_loss_r', 0.0):.2f}R")
                 c8.metric("Max losing streak", summary.get("max_loss_streak", 0))
-                c6, c7, c8 = st.columns(3)
-                c6.metric("Avg win", f"{summary['avg_win_r']:.2f}R")
-                c7.metric("Avg loss", f"{summary['avg_loss_r']:.2f}R")
-                c8.metric("Max losing streak", summary["max_loss_streak"])
 
-                if summary["total_trades"] < 50:
+                if summary.get("total_trades", 0) < 50:
                     st.warning("Small sample. Do not trust the win rate/expectancy yet.")
-                elif summary["expectancy_r"] <= 0:
+                elif summary.get("expectancy_r", 0.0) <= 0:
                     st.error(
                         "Negative expectancy. Do not use the system live yet. "
                         "Use the diagnostics below to improve selection, then validate out-of-sample."
