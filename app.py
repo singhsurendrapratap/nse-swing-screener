@@ -48,7 +48,7 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Setup score")
-        score_threshold = st.slider(
+            score_threshold = st.slider(
         "Minimum score required (out of 10)", 1, 10, DEFAULT_PARAMS.get("score_threshold", 6), 1,
         help="Trend alignment (2), relative strength (2), volume dry-up (2) + tight "
              "range (1), and volume surge (2 or 3, tiered) = 10 max, verified. Market "
@@ -91,6 +91,7 @@ with st.sidebar:
     with st.expander("More exit settings"):
         hold_days = st.slider("Max hold (trading days)", 5, 60, DEFAULT_PARAMS.get("hold_days", 20))
         friction_pct = st.slider("Friction: brokerage+STT+slippage (%)", 0.0, 0.5, 0.15, 0.05) / 100
+
 
 
     st.divider()
