@@ -94,19 +94,19 @@ MIDSMALLCAP_UNIVERSE = [
 
 DEFAULT_PARAMS = dict(
     # Exposed to the user -- these had real, visible effects across our testing.
-    atr_stop_mult=1.5,
-    breakeven_mult=1.5,
-    partial_target_mult=2.5,
-    runner_trail_mult=2.0,
+    atr_stop_mult=1.5,          # defines "1R" -- the risk unit everything else is measured against
+    breakeven_r=1.0,            # move stop to breakeven once price is +1.0R (Minervini-style)
+    partial_r=2.0,              # sell 50% once price is +2.0R
+    runner_trail_mult=2.0,      # ATR multiple for the runner's trail (paired with 20-EMA, tighter wins)
     hold_days=20,
     friction_pct=0.0015,
-    score_threshold=6,   # out of 8 (see setup_score) -- 3 of 4 factors, not all 4
+    score_threshold=6,          # out of 10 (verified true max -- see setup_score)
     rsi_low=45, rsi_high=70,
     min_earnings_growth=0.10,   # live screener only -- 10% YoY quarterly earnings growth
 
     # Fixed constants -- tested repeatedly this session with no decisive effect
     # from tuning, so simplified out of the UI rather than left as clutter.
-    volume_mult=1.5,
+    volume_mult=1.5,             # base tier for the volume-surge score component
     rs_lookback=63,
     rs_min_outperformance=0.05,
     contraction_ratio_threshold=0.70,
@@ -122,6 +122,8 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # fetched while the market is open, or a stale row with NaN OHLC.
     df = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
 
+    df["SMA20"] = df["Close"].rolling(20).mean()
+    df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["SMA50"] = df["Close"].rolling(50).mean()
     df["SMA200"] = df["Close"].rolling(200).mean()
     df["High20"] = df["High"].rolling(20).max().shift(1)      # prior 20d high, excludes today
@@ -203,8 +205,24 @@ def get_earnings_growth(symbol: str):
 # ----------------------------------------------------------------------------------
 
 def setup_score(row, market_ok: bool, params: dict) -> int:
-    """Returns -1 if a mandatory gate fails (never a valid setup that day),
-    otherwise 2-10 reflecting how many quality factors lined up."""
+    """
+    True 10-point scale (unlike the earlier 8-point version mislabeled as /10 --
+    this one actually sums to 10, verified below). Partial credit within each
+    factor instead of all-or-nothing, so a genuinely strong setup missing one
+    small thing doesn't score identically to a mediocre one.
+
+      Trend alignment (Close > SMA20 > SMA50 > SMA200):      2 pts, binary
+      Relative strength vs Nifty (beats it by real margin):   2 pts, binary
+      Volatility/volume contraction, split:
+        - recent volume dried up (Vol5Avg < VolAvg20):        2 pts
+        - AND price range also tight (ATR5/ATR20 ratio):      1 pt (needs the above too)
+      Breakout volume surge, tiered:
+        - >= 2.0x the 20-day average:                         3 pts
+        - >= 1.5x (but < 2.0x):                                2 pts
+                                                          ---------
+                                                          max = 10
+    Returns -1 if a mandatory gate fails (never a valid setup that day).
+    """
     breakout_ok = (
         row["Close"] > row["High20"]
         and params["rsi_low"] <= row["RSI14"] <= params["rsi_high"]
@@ -214,28 +232,31 @@ def setup_score(row, market_ok: bool, params: dict) -> int:
 
     score = 0
 
-    if row["Close"] > row["SMA50"] > row["SMA200"]:
-        score += 2  # trend alignment
+    if row["Close"] > row["SMA20"] > row["SMA50"] > row["SMA200"]:
+        score += 2  # full bullish MA stack, short above long
 
     rs_diff = row.get("RS_Diff")
     if pd.notna(rs_diff) and rs_diff > params.get("rs_min_outperformance", 0.05):
         score += 2  # meaningful relative strength vs Nifty
 
+    vol5, vol20 = row.get("Vol5Avg"), row.get("VolAvg20")
     ratio = row.get("ATR_ContractionRatio")
-    vol5 = row.get("Vol5Avg")
-    vol20 = row.get("VolAvg20")
-    if pd.notna(ratio) and pd.notna(vol5) and pd.notna(vol20):
-        if ratio < params.get("contraction_ratio_threshold", 0.70) and vol5 < vol20:
-            score += 2  # price AND volume both dried up before the breakout
+    if pd.notna(vol5) and pd.notna(vol20) and vol5 < vol20:
+        score += 2  # volume dried up before the breakout
+        if pd.notna(ratio) and ratio < params.get("contraction_ratio_threshold", 0.70):
+            score += 1  # AND the price range was genuinely tight too
 
-    if row["Volume"] >= params["volume_mult"] * row["VolAvg20"]:
-        score += 2  # volume expansion on the breakout day itself
+    if pd.notna(row.get("VolAvg20")):
+        if row["Volume"] >= 2.0 * row["VolAvg20"]:
+            score += 3  # strong surge
+        elif row["Volume"] >= params["volume_mult"] * row["VolAvg20"]:
+            score += 2  # moderate surge (default threshold 1.5x)
 
     return score
 
 
 def entry_signal(row, market_ok: bool, params: dict) -> bool:
-    return setup_score(row, market_ok, params) >= params.get("score_threshold", 7)
+    return setup_score(row, market_ok, params) >= params.get("score_threshold", 6)
 
 # ----------------------------------------------------------------------------------
 # LAYERED EXIT SIMULATION (used by both backtest and live position tracking)
@@ -246,12 +267,18 @@ def simulate_layered_exit(df: pd.DataFrame, i: int, entry_price: float, atr_entr
     df is the reset-index'd, per-symbol frame; i is the signal-day row index
     (entry happens at df.iloc[i+1]'s open, already priced into entry_price).
     Returns (r_multiple, days_held, exit_index).
+
+    Triggers are expressed as multiples of R (the initial risk = entry - stop),
+    not raw ATR -- ties directly to how results are reported (everything in R),
+    and matches how a lot of published trading approaches actually state their
+    rules ("move to breakeven at 1R", not "at 1.5x ATR").
     """
     fric = params["friction_pct"]
-    initial_stop = entry_price - params["atr_stop_mult"] * atr_entry
+    one_r = params["atr_stop_mult"] * atr_entry  # R in price terms
+    initial_stop = entry_price - one_r
     stop = initial_stop
-    breakeven_trigger = entry_price + params.get("breakeven_mult", 1.5) * atr_entry
-    partial_trigger = entry_price + params.get("partial_target_mult", 2.5) * atr_entry
+    breakeven_trigger = entry_price + params.get("breakeven_r", 1.0) * one_r
+    partial_trigger = entry_price + params.get("partial_r", 2.0) * one_r
     runner_trail_mult = params.get("runner_trail_mult", 2.0)
 
     partial_taken = False
@@ -288,8 +315,8 @@ def simulate_layered_exit(df: pd.DataFrame, i: int, entry_price: float, atr_entr
                 break
             highest_close = max(highest_close, day["Close"])
             atr_trail = highest_close - runner_trail_mult * day_atr
-            structural_trail = day["Low20"] if pd.notna(day.get("Low20")) else atr_trail
-            stop = max(stop, atr_trail, structural_trail)  # tighter (higher) of the two
+            ema_trail = day["EMA20"] if pd.notna(day.get("EMA20")) else atr_trail
+            stop = max(stop, atr_trail, ema_trail)  # tighter (higher) of the two
 
     if r_multiple is None:
         exit_index = min(i + params["hold_days"], len(df) - 1)
@@ -418,8 +445,8 @@ def screen_today(universe, capital, risk_pct, params) -> tuple[pd.DataFrame, boo
                 stop = entry - params["atr_stop_mult"] * atr
                 risk_per_share = entry - stop
                 shares = int(max_risk_amount // risk_per_share) if risk_per_share > 0 else 0
-                breakeven_at = entry + params.get("breakeven_mult", 1.5) * atr
-                partial_at = entry + params.get("partial_target_mult", 2.5) * atr
+                breakeven_at = entry + params.get("breakeven_r", 1.0) * params["atr_stop_mult"] * atr
+                partial_at = entry + params.get("partial_r", 2.0) * params["atr_stop_mult"] * atr
 
                 rows.append({
                     "Symbol": sym.replace(".NS", ""),
@@ -433,7 +460,7 @@ def screen_today(universe, capital, risk_pct, params) -> tuple[pd.DataFrame, boo
                     "Risk %": round(risk_per_share / entry * 100, 2),
                     "Earnings Growth YoY": f"{earnings_growth*100:.1f}%",
                     "_score_num": score,
-                    "Setup Score": f"{score}/8",
+                    "Setup Score": f"{score}/10",
                     "RSI14": round(last["RSI14"], 1),
                 })
         except Exception:
