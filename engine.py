@@ -432,7 +432,7 @@ def screen_today(universe, capital, risk_pct, params) -> tuple[pd.DataFrame, boo
             if pd.isna(last.get("SMA200")):
                 continue
             score = setup_score(last, is_bullish, params)
-            if score >= params.get("score_threshold", 7):
+            if score >= params.get("score_threshold", 6):
                 # Fundamental gate, live-only: only spend the extra API call on
                 # names that already passed the technical bar.
                 earnings_growth = get_earnings_growth(sym)
