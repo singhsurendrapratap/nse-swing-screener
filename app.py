@@ -48,7 +48,7 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Setup score")
-            score_threshold = st.slider(
+    score_threshold = st.slider(
         "Minimum score required (out of 10)", 1, 10, DEFAULT_PARAMS.get("score_threshold", 6), 1,
         help="Trend alignment (2), relative strength (2), volume dry-up (2) + tight "
              "range (1), and volume surge (2 or 3, tiered) = 10 max, verified. Market "
