@@ -217,11 +217,15 @@ with tab2:
                 st.info("No trades passed the filters in this period.")
             else:
                 c1, c2, c3, c4, c5 = st.columns(5)
-                c1.metric("Trades", summary["total_trades"])
-                c2.metric("Win rate", f"{summary['win_rate']:.1f}%")
-                c3.metric("Expectancy", f"{summary['expectancy_r']:.2f}R")
-                c4.metric("Profit factor", f"{summary['profit_factor']:.2f}")
-                c5.metric("Total R", f"{summary['total_r']:.2f}R")
+c1.metric("Trades", summary.get("total_trades", 0))
+c2.metric("Win rate", f"{summary.get('win_rate', 0.0):.1f}%")
+c3.metric("Expectancy", f"{summary.get('expectancy_r', 0.0):.2f}R")
+
+pf = summary.get("profit_factor", 0.0)
+c4.metric("Profit factor", f"{pf:.2f}" if isinstance(pf, (int, float)) else str(pf))
+
+c5.metric("Total R", f"{summary.get('total_r', 0.0):.2f}R")
+
 
                 c6, c7, c8 = st.columns(3)
                 c6.metric("Avg win", f"{summary['avg_win_r']:.2f}R")
