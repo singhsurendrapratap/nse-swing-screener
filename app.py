@@ -48,20 +48,20 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Setup score")
-    score_threshold = st.slider(
-        "Minimum score required (out of 10)", 1, 10, DEFAULT_PARAMS["score_threshold"], 1,
+        score_threshold = st.slider(
+        "Minimum score required (out of 10)", 1, 10, DEFAULT_PARAMS.get("score_threshold", 6), 1,
         help="Trend alignment (2), relative strength (2), volume dry-up (2) + tight "
              "range (1), and volume surge (2 or 3, tiered) = 10 max, verified. Market "
              "regime, breakout, and RSI band are separate mandatory gates, always "
              "required regardless of score.",
     )
-    rsi_low, rsi_high = st.slider("RSI sanity band", 0, 100, (DEFAULT_PARAMS["rsi_low"], DEFAULT_PARAMS["rsi_high"]))
+    rsi_low, rsi_high = st.slider("RSI sanity band", 0, 100, (DEFAULT_PARAMS.get("rsi_low", 45), DEFAULT_PARAMS.get("rsi_high", 70)))
 
     st.divider()
     st.subheader("Fundamental gate (live screener only)")
     min_earnings_growth = st.slider(
         "Min quarterly earnings growth, YoY (%)", 0, 50,
-        int(DEFAULT_PARAMS["min_earnings_growth"] * 100), 5,
+        int(DEFAULT_PARAMS.get("min_earnings_growth", 0.10) * 100), 5,
         help="CANSLIM's 'Current earnings growth' check -- only stocks with real, "
              "recent earnings growth qualify, not price action alone. This can't be "
              "backtested honestly (Yahoo only gives today's figure, not history), "
@@ -71,12 +71,12 @@ with st.sidebar:
     st.divider()
     st.subheader("Exit (layered)")
     atr_stop = st.slider(
-        "Initial stop-loss (x ATR)", 0.5, 3.0, DEFAULT_PARAMS["atr_stop_mult"], 0.1,
+        "Initial stop-loss (x ATR)", 0.5, 3.0, DEFAULT_PARAMS.get("atr_stop_mult", 1.5), 0.1,
         help="This distance also defines '1R' -- everything below is measured "
              "in multiples of this risk unit, not raw ATR.",
     )
-    breakeven_r = st.slider("Move to breakeven at (+R)", 0.5, 3.0, DEFAULT_PARAMS["breakeven_r"], 0.1)
-    partial_r = st.slider("Sell 50% at (+R)", 1.0, 5.0, DEFAULT_PARAMS["partial_r"], 0.1)
+    breakeven_r = st.slider("Move to breakeven at (+R)", 0.5, 3.0, DEFAULT_PARAMS.get("breakeven_r", 1.0), 0.1)
+    partial_r = st.slider("Sell 50% at (+R)", 1.0, 5.0, DEFAULT_PARAMS.get("partial_r", 2.0), 0.1)
     if partial_r <= breakeven_r:
         st.error(
             f"⚠️ 'Sell 50%' ({partial_r}R) should be LARGER than "
@@ -84,13 +84,14 @@ with st.sidebar:
             "never gets a chance to act on its own. Adjust one of them."
         )
     runner_trail_mult = st.slider(
-        "Trail the rest (x ATR, paired with 20-EMA)", 1.0, 4.0, DEFAULT_PARAMS["runner_trail_mult"], 0.1,
+        "Trail the rest (x ATR, paired with 20-EMA)", 1.0, 4.0, DEFAULT_PARAMS.get("runner_trail_mult", 2.0), 0.1,
         help="After the partial sell, the stop trails behind whichever is tighter: "
              "this ATR multiple below the highest close, or the 20-day EMA.",
     )
     with st.expander("More exit settings"):
-        hold_days = st.slider("Max hold (trading days)", 5, 60, DEFAULT_PARAMS["hold_days"])
+        hold_days = st.slider("Max hold (trading days)", 5, 60, DEFAULT_PARAMS.get("hold_days", 20))
         friction_pct = st.slider("Friction: brokerage+STT+slippage (%)", 0.0, 0.5, 0.15, 0.05) / 100
+
 
     st.divider()
     universe_choice = st.radio(
