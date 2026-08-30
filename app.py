@@ -1,7 +1,11 @@
 """
 NSE Swing / Positional Screener -- Streamlit app
 
-Copy this file to app.py and engine_new.py to engine.py in the same GitHub repo.
+Deployment: this repo needs exactly two files, named exactly app.py and
+engine.py -- replace their entire contents with these two files (this one,
+and engine.py) each time. Check the version string in the sidebar footer
+after any redeploy to confirm it actually took.
+
 Run with: streamlit run app.py
 """
 
@@ -13,10 +17,13 @@ from engine import (
     DEFAULT_UNIVERSE,
     MIDSMALLCAP_UNIVERSE,
     DEFAULT_PARAMS,
+    ENGINE_VERSION,
     run_backtest,
     screen_today,
     evaluate_positions,
 )
+
+APP_VERSION = "app-2026-08-30-a"
 
 POSITIONS_FILE = "positions.csv"
 POSITIONS_COLS = ["Symbol", "Entry Date", "Entry Price", "Qty", "Stop", "Target"]
@@ -374,3 +381,5 @@ st.caption(
     "Educational research tool, not investment advice. A positive backtest is not proof "
     "of future profitability. Use out-of-sample / walk-forward validation before risking money."
 )
+st.caption(f"Build check: `{APP_VERSION}` (app) / `{ENGINE_VERSION}` (engine) -- "
+           f"if this doesn't match what you just pasted, the redeploy didn't take.")
