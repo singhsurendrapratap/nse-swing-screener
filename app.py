@@ -328,18 +328,28 @@ with tab2:
         out_sample_pct = st.slider("Out-of-sample size (most recent %, held out)", 20, 50, 35, 5)
         split_date_input = None
     if st.button("🧪 Run walk-forward validation"):
+        if st.button("🧪 Run walk-forward validation"):
         if not universe:
             st.error("Select at least one ticker.")
         elif partial_r <= breakeven_r:
             st.error("Fix the exit settings first.")
         else:
             with st.spinner(f"Generating trades across {backtest_years} years, then splitting..."):
-                if split_date_input:
-                    wf = run_walk_forward_backtest(universe, backtest_years, params,
-                                                    split_date=split_date_input.isoformat())
+                if split_mode.startswith("Fixed") and split_date_input:
+                    wf = run_walk_forward_backtest(
+                        universe=universe,
+                        years=backtest_years,
+                        params=params,
+                        split_date=str(split_date_input)
+                    )
                 else:
-                    wf = run_walk_forward_backtest(universe, backtest_years, params,
-                                                    out_sample_frac=out_sample_pct / 100)
+                    wf = run_walk_forward_backtest(
+                        universe=universe,
+                        years=backtest_years,
+                        params=params,
+                        out_sample_frac=float(out_sample_pct / 100)
+                    )
+
 
             if not wf.get("in_sample") or not wf.get("out_sample"):
                 st.info("Not enough trades in this window to split meaningfully -- widen years or universe.")
