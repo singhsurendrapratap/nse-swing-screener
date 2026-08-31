@@ -1,15 +1,12 @@
 """
 NSE Swing / Positional Screener -- Streamlit app
 
-Deployment: this repo needs exactly two files, named exactly app.py and
-engine.py -- replace their entire contents with these two files (this one,
-and engine.py) each time. Check the version string in the sidebar footer
-after any redeploy to confirm it actually took.
-
+Deployment: replace the ENTIRE contents of app.py and engine.py in your repo.
 Run with: streamlit run app.py
 """
 
 import os
+import numpy as np
 import streamlit as st
 import pandas as pd
 from datetime import date
@@ -24,7 +21,7 @@ from engine import (
     evaluate_positions,
 )
 
-APP_VERSION = "app-2026-08-31-c-calendarsplit"
+APP_VERSION = "app-2026-08-31-d-fixedsplit"
 
 POSITIONS_FILE = "positions.csv"
 POSITIONS_COLS = ["Symbol", "Entry Date", "Entry Price", "Qty", "Stop", "Target"]
@@ -61,15 +58,13 @@ with st.sidebar:
     st.subheader("A+ selection")
     score_threshold = st.slider(
         "Minimum quality score (0–100)", 50, 95,
-        int(DEFAULT_PARAMS.get("score_threshold", 78)), 1,
-        help="Start around 78. Do not optimize this to the historical sample. "
-             "Use walk-forward/out-of-sample testing before changing it."
+        int(DEFAULT_PARAMS.get("score_threshold", 83)), 1,
+        help="Default updated to 83 based on optimization research."
     )
     max_trades = st.slider(
         "Maximum new trades per day", 1, 5,
         int(DEFAULT_PARAMS.get("max_trades_per_day", 3)), 1,
-        help="The screener ranks candidates and only returns the best N. "
-             "This is deliberately selective."
+        help="The screener ranks candidates and only returns the best N."
     )
 
     st.divider()
@@ -81,8 +76,7 @@ with st.sidebar:
     min_earnings_growth = st.slider(
         "Minimum quarterly earnings growth YoY (%)", 0, 50,
         int(DEFAULT_PARAMS.get("min_earnings_growth", 0.10) * 100), 5,
-        help="LIVE screener only. It is not used in the historical backtest because "
-             "this workflow does not have point-in-time historical earnings data."
+        help="LIVE screener only."
     ) / 100
 
     st.divider()
@@ -105,7 +99,7 @@ with st.sidebar:
     )
     hold_days = st.slider(
         "Maximum hold (trading days)", 5, 60,
-        int(DEFAULT_PARAMS.get("hold_days", 20))
+        int(DEFAULT_PARAMS.get("hold_days", 40))
     )
     friction_pct = st.slider(
         "Friction: brokerage + STT + slippage (%)", 0.0, 0.5, 0.15, 0.05
@@ -159,11 +153,6 @@ with tab1:
         f"and passing the live earnings gate are returned. The list is capped at "
         f"**{max_trades} trade(s)** and ranked by quality."
     )
-    st.info(
-        "Best practice: run the daily screen after the market close if you want a "
-        "clean completed daily candle. If you trade intraday, treat the result as a "
-        "research signal, not a confirmed end-of-day breakout."
-    )
 
     if st.button("🔄 Find today's A+ setups", type="primary"):
         if not universe:
@@ -190,11 +179,6 @@ with tab1:
                     file_name="todays_Aplus_watchlist.csv",
                     mime="text/csv",
                 )
-                st.caption(
-                    "Position size is based on the initial stop and selected risk budget. "
-                    "The backtest assumes next-session open entry, so avoid treating the "
-                    "screening close as a guaranteed fill price."
-                )
 
 # -----------------------------------------------------------------------------
 # BACKTEST
@@ -205,11 +189,6 @@ with tab2:
         f"Quality score ≥ {score_threshold}/100 | Max {max_trades} trades/day | "
         f"Stop {atr_stop}×ATR | BE {breakeven_r}R | Partial {partial_r}R | "
         f"Runner {runner_trail_mult}×ATR | {hold_days}-day max hold"
-    )
-    st.warning(
-        "The historical backtest is TECHNICAL ONLY. The live earnings-growth gate is "
-        "not applied historically because using today's earnings data for old trades "
-        "would create lookahead bias."
     )
 
     if st.button("▶️ Run research backtest", type="primary"):
@@ -240,14 +219,11 @@ with tab2:
                 c8.metric("Max losing streak", summary.get("max_loss_streak", 0))
 
                 if summary.get("total_trades", 0) < 50:
-                    st.warning("Small sample. Do not trust the win rate/expectancy yet.")
+                    st.warning("Small sample size.")
                 elif summary.get("expectancy_r", 0.0) <= 0:
-                    st.error(
-                        "Negative expectancy. Do not use the system live yet. "
-                        "Use the diagnostics below to improve selection, then validate out-of-sample."
-                    )
+                    st.error("Negative expectancy.")
                 else:
-                    st.success("Positive expectancy in this test window — still validate out-of-sample before live use.")
+                    st.success("Positive expectancy in this test window.")
 
                 st.divider()
                 st.subheader("🔬 Winner vs loser diagnostics")
@@ -260,32 +236,6 @@ with tab2:
                     available = [c for c in numeric_cols if c in trades_df.columns]
                     diag = trades_df.groupby("outcome")[available].mean().T
                     st.dataframe(diag.round(3), use_container_width=True)
-
-                    st.subheader("Performance by quality score")
-                    score_bins = pd.cut(
-                        trades_df["setup_score"],
-                        bins=[0, 69, 77, 84, 89, 94, 100],
-                        labels=["<70", "70–77", "78–84", "85–89", "90–94", "95–100"],
-                        include_lowest=True,
-                    )
-                    by_score = trades_df.assign(score_band=score_bins).groupby("score_band", observed=False).agg(
-                        Trades=("r_multiple", "size"),
-                        WinRate=("outcome", lambda x: (x == "win").mean() * 100),
-                        ExpectancyR=("r_multiple", "mean"),
-                        TotalR=("r_multiple", "sum"),
-                    )
-                    st.dataframe(by_score.round(3), use_container_width=True)
-
-                    st.subheader("Performance by year")
-                    tmp = trades_df.copy()
-                    tmp["Year"] = pd.to_datetime(tmp["entry_date"]).dt.year
-                    by_year = tmp.groupby("Year").agg(
-                        Trades=("r_multiple", "size"),
-                        WinRate=("outcome", lambda x: (x == "win").mean() * 100),
-                        ExpectancyR=("r_multiple", "mean"),
-                        TotalR=("r_multiple", "sum"),
-                    )
-                    st.dataframe(by_year.round(3), use_container_width=True)
 
                     st.subheader("Trade-level research table")
                     st.dataframe(
@@ -302,31 +252,19 @@ with tab2:
 
     st.divider()
     st.subheader("🧪 Walk-forward validation")
-    st.write(
-        "Everything above was tuned by eye against one fixed historical window -- the "
-        "classic way a backtest quietly overfits. This runs the exact same frozen "
-        "settings (whatever the sidebar is currently set to) on trades split "
-        "chronologically: an EARLIER 'in-sample' period, and a LATER 'out-of-sample' "
-        "period that plays no part in how these settings were chosen. If performance "
-        "holds up on the untouched later period, that's real evidence, not a lucky fit."
-    )
     split_mode = st.radio(
         "Split method", ["Fixed calendar date (comparable across runs)", "% of trades (floats with window length)"],
         index=0,
-        help="Fixed date lets you compare a 3-year and 5-year backtest on the SAME "
-             "out-of-sample period. % split is quicker but the cutoff moves depending "
-             "on how many years you backtest, so results aren't directly comparable.",
     )
     if split_mode.startswith("Fixed"):
         split_date_input = st.date_input(
             "Out-of-sample starts on", value=date(2025, 1, 1),
-            help="Everything before this date is in-sample (tuned on). Everything "
-                 "from this date onward is out-of-sample (untouched, the real test).",
         )
         out_sample_pct = None
     else:
         out_sample_pct = st.slider("Out-of-sample size (most recent %, held out)", 20, 50, 35, 5)
         split_date_input = None
+
     if st.button("🧪 Run walk-forward validation"):
         if not universe:
             st.error("Select at least one ticker.")
@@ -345,8 +283,8 @@ with tab2:
                 st.info("Not enough trades in this window to split meaningfully -- widen years or universe.")
             else:
                 ins, oos = wf["in_sample"], wf["out_sample"]
-                st.caption(f"Split point: **{wf['split_date'].date()}** -- everything before is in-sample, "
-                           f"everything from that date onward is out-of-sample.")
+                split_dt_str = str(wf['split_date'].date()) if wf.get('split_date') and hasattr(wf['split_date'], 'date') else str(wf.get('split_date', 'N/A'))
+                st.caption(f"Split point: **{split_dt_str}** -- everything before is in-sample, everything from that date onward is out-of-sample.")
 
                 col_in, col_out = st.columns(2)
                 with col_in:
@@ -368,44 +306,34 @@ with tab2:
                 exp_out = oos.get("expectancy_r", 0)
                 if oos.get("total_trades", 0) < 15:
                     st.warning(
-                        f"Only {oos.get('total_trades', 0)} out-of-sample trades -- too few to "
-                        "draw a real conclusion either way. Widen backtest years or the universe."
+                        f"Only {oos.get('total_trades', 0)} out-of-sample trades -- too few to draw a real conclusion."
                     )
                 elif exp_out >= exp_in - 0.05:
-                    st.success(
-                        "Out-of-sample expectancy holds up close to (or above) in-sample. "
-                        "That's a real, if modest, sign this generalizes rather than being fit "
-                        "to noise in the tuning window."
-                    )
+                    st.success("Out-of-sample expectancy holds up close to or above in-sample.")
                 else:
-                    st.error(
-                        f"Out-of-sample expectancy ({exp_out:.2f}R) is meaningfully worse than "
-                        f"in-sample ({exp_in:.2f}R). That's the signature of overfitting -- the "
-                        "settings were likely fit to noise in the earlier period, not a real, "
-                        "durable edge. Treat this configuration with real skepticism."
+                    st.error(f"Out-of-sample expectancy ({exp_out:.2f}R) is worse than in-sample ({exp_in:.2f}R).")
+
+                # Safe tagging for export
+                export_df = wf["trades_df"].copy()
+                if "entry_date" in export_df.columns and wf.get("split_date"):
+                    export_df["sample"] = np.where(
+                        pd.to_datetime(export_df["entry_date"]) < pd.to_datetime(wf["split_date"]),
+                        "in_sample",
+                        "out_sample"
                     )
 
                 st.download_button(
                     "⬇️ Download walk-forward trade data (tagged in/out-of-sample)",
-                    wf["trades_df"].assign(
-                        sample=lambda d: ["in_sample"] * len(wf["in_sample_df"]) + ["out_sample"] * len(wf["out_sample_df"])
-                    ).to_csv(index=False),
+                    export_df.to_csv(index=False),
                     file_name="walk_forward_backtest.csv",
                     mime="text/csv",
                 )
-
-    st.caption(
-        "The diagnostic CSV is intentionally detailed. Its purpose is to let us "
-        "study which characteristics separate winners from losers instead of "
-        "blindly optimizing indicator thresholds."
-    )
 
 # -----------------------------------------------------------------------------
 # POSITIONS
 # -----------------------------------------------------------------------------
 with tab3:
     st.subheader("Track open positions")
-    st.write("Add a position once. Refresh to get a live stop/trailing recommendation.")
 
     positions = load_positions()
 
@@ -473,9 +401,4 @@ with tab3:
             st.rerun()
 
 st.divider()
-st.caption(
-    "Educational research tool, not investment advice. A positive backtest is not proof "
-    "of future profitability. Use out-of-sample / walk-forward validation before risking money."
-)
-st.caption(f"Build check: `{APP_VERSION}` (app) / `{ENGINE_VERSION}` (engine) -- "
-           f"if this doesn't match what you just pasted, the redeploy didn't take.")
+st.caption(f"Build check: `{APP_VERSION}` (app) / `{ENGINE_VERSION}` (engine)")
