@@ -4,25 +4,11 @@ engine.py -- NSE swing/positional stock-selection engine
 Design goal:
     Trade LESS, but make each trade a higher-quality candidate.
 
-This version changes the original system in four important ways:
-1) A 0-100 quality score replaces the coarse 0/2/3 point buckets.
-2) Breakout QUALITY is scored, not merely "close > prior 20-day high".
-3) The backtest records diagnostics for every trade so winners vs losers can be studied.
-4) The live screener ranks candidates and can cap the number of trades per day.
-
-Important:
-- The live earnings-growth filter is still LIVE ONLY. It is not used in the
-  historical backtest because yfinance does not provide reliable point-in-time
-  historical earnings growth in this workflow.
-- This is a research tool, not investment advice.
-
 DEPLOYMENT: replace the ENTIRE contents of your repo's engine.py with this
-file's contents (same for app.py). After several mismatched-deploy incidents
-this session, ENGINE_VERSION below exists specifically so you can confirm a
-redeploy actually took -- check the sidebar footer against this string.
+file's contents (same for app.py).
 """
 
-ENGINE_VERSION = "engine-2026-08-31-c-calendarsplit"
+ENGINE_VERSION = "engine-2026-08-31-d-fixedsplit"
 
 import pandas as pd
 import numpy as np
@@ -66,14 +52,14 @@ DEFAULT_PARAMS = dict(
     hold_days=20,
     friction_pct=0.0015,
 
-    # New selection engine
-    score_threshold=78,
+    # Selection engine
+    score_threshold=83,
     max_trades_per_day=3,
     rsi_low=45,
     rsi_high=70,
     min_earnings_growth=0.10,
 
-    # Fixed research constants; change only after out-of-sample testing.
+    # Research constants
     rs_lookback=63,
     rs_min_outperformance=0.05,
     breakout_min_atr=0.25,
@@ -89,12 +75,10 @@ DEFAULT_PARAMS = dict(
 # -----------------------------------------------------------------------------
 
 def _flatten_single_ticker_columns(df: pd.DataFrame, symbol: str | None = None) -> pd.DataFrame:
-    """Make yfinance output consistently OHLCV for one ticker."""
     if df is None or df.empty:
         return pd.DataFrame()
     out = df.copy()
     if isinstance(out.columns, pd.MultiIndex):
-        # Typical single-ticker download: level 0 = Price, level 1 = Ticker.
         if symbol is not None:
             try:
                 out = out.xs(symbol, axis=1, level=-1)
@@ -141,19 +125,15 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["ATR5"] = atr5
     df["ATR20"] = atr20
 
-    # Pre-breakout contraction is measured through yesterday.
     df["ATR_ContractionRatio"] = (atr5 / atr20).shift(1)
     df["Vol5Avg"] = df["Volume"].rolling(5).mean().shift(1)
 
-    # Multi-horizon momentum / relative strength.
     for n in (20, 63, 126):
         df[f"Return{n}"] = df["Close"].pct_change(n)
 
-    # Trend slopes are normalized so they are comparable across stocks.
     df["EMA20_Slope5"] = df["EMA20"].pct_change(5)
     df["SMA50_Slope20"] = df["SMA50"].pct_change(20)
 
-    # Breakout-day candle quality.
     prev_close = df["Close"].shift(1)
     day_range = (df["High"] - df["Low"]).replace(0, np.nan)
     df["GapPct"] = (df["Open"] / prev_close - 1) * 100
@@ -162,7 +142,6 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["CloseLocation"] = (df["Close"] - df["Low"]) / day_range
     df["UpperWickPct"] = (df["High"] - df[["Open", "Close"]].max(axis=1)) / day_range
 
-    # How far beyond resistance the close is, in volatility units.
     df["BreakoutATR"] = (df["Close"] - df["High20"]) / df["ATR14"].replace(0, np.nan)
     df["ExtensionATR"] = (df["Close"] - df["EMA20"]) / df["ATR14"].replace(0, np.nan)
     df["VolumeRatio"] = df["Volume"] / df["VolAvg20"].replace(0, np.nan)
@@ -183,7 +162,6 @@ def get_nifty_data(start_date: str) -> pd.DataFrame:
 
 
 def get_market_regime(nifty_df: pd.DataFrame) -> pd.Series:
-    """Base long regime: Nifty Close > EMA20 > SMA50."""
     if nifty_df.empty:
         return pd.Series(dtype=bool)
     cond = (
@@ -202,7 +180,6 @@ def add_relative_strength(df: pd.DataFrame, nifty_close: pd.Series, lookback: in
     aligned = nifty_close.reindex(df.index, method="ffill")
     for n in (20, 63, 126):
         df[f"RS_Diff{n}"] = df["Close"].pct_change(n) - aligned.pct_change(n)
-    # Preserve the old field name for compatibility.
     df["RS_Diff"] = df[f"RS_Diff{lookback}"]
     return df
 
@@ -222,7 +199,7 @@ def get_earnings_growth(symbol: str):
 def market_quality(row, market_ok: bool) -> tuple[int, str]:
     if not market_ok:
         return 0, "BEAR/CHOP"
-    score = 8  # base bullish structure
+    score = 8
     if pd.notna(row.get("EMA20_Slope5")) and row["EMA20_Slope5"] > 0:
         score += 4
     if pd.notna(row.get("SMA50_Slope20")) and row["SMA50_Slope20"] > 0:
@@ -241,18 +218,11 @@ def _clip_score(x, lo=0, hi=100):
 
 
 def score_setup(row, market_ok: bool, params: dict, earnings_growth=None, include_earnings=False):
-    """Return a detailed 0-100 setup score plus diagnostics.
-
-    The score is deliberately interpretable rather than machine-learned.
-    It is intended for ranking and research, not as a claim of predictive certainty.
-    """
     components = {}
 
-    # 1. Market regime: 15
     mkt_score, regime = market_quality(row, market_ok)
     components["market"] = mkt_score
 
-    # 2. Trend quality: 15
     trend = 0
     if pd.notna(row.get("Close")) and pd.notna(row.get("EMA20")) and row["Close"] > row["EMA20"]:
         trend += 5
@@ -264,7 +234,6 @@ def score_setup(row, market_ok: bool, params: dict, earnings_growth=None, includ
         trend += 2
     components["trend"] = min(trend, 15)
 
-    # 3. Relative strength: 15
     rs = 0
     rs20, rs63, rs126 = row.get("RS_Diff20"), row.get("RS_Diff63"), row.get("RS_Diff126")
     if pd.notna(rs20) and rs20 > 0:
@@ -280,7 +249,6 @@ def score_setup(row, market_ok: bool, params: dict, earnings_growth=None, includ
         rs += 3
     components["relative_strength"] = min(rs, 15)
 
-    # 4. Breakout quality: 20
     bo = 0
     b_atr = row.get("BreakoutATR")
     if pd.notna(b_atr):
@@ -314,7 +282,6 @@ def score_setup(row, market_ok: bool, params: dict, earnings_growth=None, includ
             bo += 2
     components["breakout"] = min(bo, 20)
 
-    # 5. Volume confirmation: 15
     vol = 0
     vr = row.get("VolumeRatio")
     if pd.notna(vr):
@@ -328,7 +295,6 @@ def score_setup(row, market_ok: bool, params: dict, earnings_growth=None, includ
             vol += 5
     components["volume"] = min(vol, 15)
 
-    # 6. Pre-breakout contraction: 10
     con = 0
     vol5, vol20, cr = row.get("Vol5Avg"), row.get("VolAvg20"), row.get("ATR_ContractionRatio")
     if pd.notna(vol5) and pd.notna(vol20) and vol5 < vol20:
@@ -342,7 +308,6 @@ def score_setup(row, market_ok: bool, params: dict, earnings_growth=None, includ
             con += 1
     components["contraction"] = min(con, 10)
 
-    # 7. RSI quality: 5
     rsi_score = 0
     rsi = row.get("RSI14")
     if pd.notna(rsi):
@@ -352,7 +317,6 @@ def score_setup(row, market_ok: bool, params: dict, earnings_growth=None, includ
             rsi_score = 3
     components["rsi"] = rsi_score
 
-    # 8. Extension / chase control: 5
     ext_score = 0
     ext = row.get("ExtensionATR")
     if pd.notna(ext):
@@ -364,8 +328,6 @@ def score_setup(row, market_ok: bool, params: dict, earnings_growth=None, includ
 
     technical_score = sum(components.values())
 
-    # Earnings is intentionally an additive live-only filter, not part of the
-    # historical technical score. Keep the technical max at 100.
     if include_earnings:
         min_growth = params.get("min_earnings_growth", 0.10)
         earnings_ok = earnings_growth is not None and earnings_growth >= min_growth
@@ -530,7 +492,6 @@ def backtest_symbol(df: pd.DataFrame, market_regime: pd.Series, params: dict) ->
                 "volume_score": components["volume"],
                 "contraction_score": components["contraction"],
             })
-            # No overlapping positions in the same stock.
             i = exit_index + 1
         else:
             i += 1
@@ -550,10 +511,6 @@ def _extract_symbol_frame(data: pd.DataFrame, sym: str, universe_len: int) -> pd
 
 
 def _generate_all_trades(universe, years, params) -> pd.DataFrame:
-    """Core trade generation, shared by run_backtest and the walk-forward split.
-    Indicators need continuous lookback history, so this always runs across the
-    FULL requested window -- splitting into in-sample/out-of-sample happens
-    afterward, on the resulting trades, not by truncating the price history."""
     start = (datetime.now() - timedelta(days=365 * years + 260)).strftime("%Y-%m-%d")
     nifty_df = get_nifty_data(start)
     market_regime = get_market_regime(nifty_df)
@@ -622,27 +579,16 @@ def run_backtest(universe, years, params, return_candidates=False) -> tuple[pd.D
 
 
 def run_walk_forward_backtest(universe, years, params, out_sample_frac: float = 0.35, split_date: str = None) -> dict:
-    """
-    Splits the SAME set of generated trades into an in-sample (earlier) period
-    and an out-of-sample (later) period, using the exact same frozen params for
-    both -- nothing is re-tuned per half. If the out-of-sample half performs
-    meaningfully worse than in-sample, that's a real warning sign the earlier
-    tuning was fitting to noise in that specific window rather than finding
-    something that generalizes.
-
-    Two split modes:
-      - split_date given (e.g. "2025-01-01"): FIXED calendar cutoff. Use this
-        when comparing walk-forward results across different `years` settings --
-        a % split floats with window length, so a 3-year and 5-year backtest
-        end up testing different out-of-sample periods and aren't comparable.
-        A fixed date answers the same question every time: "does this hold up
-        on 2025-2026 specifically?"
-      - split_date not given: falls back to the % split (out_sample_frac of
-        trades, chronologically), useful for quick single-run checks.
-    """
     trades_df = _generate_all_trades(universe, years, params)
-    if trades_df.empty or len(trades_df) < 10:
-        return {"trades_df": trades_df, "in_sample": {}, "out_sample": {}, "split_date": None}
+    if trades_df.empty or len(trades_df) < 5:
+        return {
+            "trades_df": trades_df,
+            "in_sample_df": pd.DataFrame(),
+            "out_sample_df": pd.DataFrame(),
+            "in_sample": {},
+            "out_sample": {},
+            "split_date": pd.to_datetime(split_date) if split_date else None,
+        }
 
     trades_df["entry_date"] = pd.to_datetime(trades_df["entry_date"])
     trades_df = trades_df.sort_values("entry_date").reset_index(drop=True)
@@ -711,7 +657,6 @@ def screen_today(universe, capital, risk_pct, params) -> tuple[pd.DataFrame, boo
             if pd.isna(last.get("SMA200")):
                 continue
 
-            # Earnings is checked only after the technical score passes.
             tech = score_setup(last, is_bullish, params, include_earnings=False)
             if not tech["mandatory_ok"] or tech["score"] < params.get("score_threshold", 78):
                 continue
