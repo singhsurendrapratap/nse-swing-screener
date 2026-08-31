@@ -22,7 +22,7 @@ this session, ENGINE_VERSION below exists specifically so you can confirm a
 redeploy actually took -- check the sidebar footer against this string.
 """
 
-ENGINE_VERSION = "engine-2026-08-30-b-walkforward"
+ENGINE_VERSION = "engine-2026-08-31-c-calendarsplit"
 
 import pandas as pd
 import numpy as np
@@ -621,14 +621,24 @@ def run_backtest(universe, years, params, return_candidates=False) -> tuple[pd.D
     return trades_df, _summarize_trades(trades_df, params)
 
 
-def run_walk_forward_backtest(universe, years, params, out_sample_frac: float = 0.35) -> dict:
+def run_walk_forward_backtest(universe, years, params, out_sample_frac: float = 0.35, split_date: str = None) -> dict:
     """
-    Splits the SAME set of generated trades chronologically into an in-sample
-    (earlier) period and an out-of-sample (later) period, using the exact same
-    frozen params for both -- nothing is re-tuned per half. If the out-of-sample
-    half performs meaningfully worse than in-sample, that's a real warning sign
-    the earlier tuning was fitting to noise in that specific window rather than
-    finding something that generalizes.
+    Splits the SAME set of generated trades into an in-sample (earlier) period
+    and an out-of-sample (later) period, using the exact same frozen params for
+    both -- nothing is re-tuned per half. If the out-of-sample half performs
+    meaningfully worse than in-sample, that's a real warning sign the earlier
+    tuning was fitting to noise in that specific window rather than finding
+    something that generalizes.
+
+    Two split modes:
+      - split_date given (e.g. "2025-01-01"): FIXED calendar cutoff. Use this
+        when comparing walk-forward results across different `years` settings --
+        a % split floats with window length, so a 3-year and 5-year backtest
+        end up testing different out-of-sample periods and aren't comparable.
+        A fixed date answers the same question every time: "does this hold up
+        on 2025-2026 specifically?"
+      - split_date not given: falls back to the % split (out_sample_frac of
+        trades, chronologically), useful for quick single-run checks.
     """
     trades_df = _generate_all_trades(universe, years, params)
     if trades_df.empty or len(trades_df) < 10:
@@ -637,12 +647,17 @@ def run_walk_forward_backtest(universe, years, params, out_sample_frac: float = 
     trades_df["entry_date"] = pd.to_datetime(trades_df["entry_date"])
     trades_df = trades_df.sort_values("entry_date").reset_index(drop=True)
 
-    split_idx = int(len(trades_df) * (1 - out_sample_frac))
-    split_idx = max(1, min(split_idx, len(trades_df) - 1))  # keep both halves non-empty
-    split_date = trades_df.iloc[split_idx]["entry_date"]
-
-    in_sample_df = trades_df.iloc[:split_idx].reset_index(drop=True)
-    out_sample_df = trades_df.iloc[split_idx:].reset_index(drop=True)
+    if split_date:
+        cutoff = pd.to_datetime(split_date)
+        in_sample_df = trades_df[trades_df["entry_date"] < cutoff].reset_index(drop=True)
+        out_sample_df = trades_df[trades_df["entry_date"] >= cutoff].reset_index(drop=True)
+        actual_split = cutoff
+    else:
+        split_idx = int(len(trades_df) * (1 - out_sample_frac))
+        split_idx = max(1, min(split_idx, len(trades_df) - 1))
+        actual_split = trades_df.iloc[split_idx]["entry_date"]
+        in_sample_df = trades_df.iloc[:split_idx].reset_index(drop=True)
+        out_sample_df = trades_df.iloc[split_idx:].reset_index(drop=True)
 
     return {
         "trades_df": trades_df,
@@ -650,7 +665,7 @@ def run_walk_forward_backtest(universe, years, params, out_sample_frac: float = 
         "out_sample_df": out_sample_df,
         "in_sample": _summarize_trades(in_sample_df, params),
         "out_sample": _summarize_trades(out_sample_df, params),
-        "split_date": split_date,
+        "split_date": actual_split,
     }
 
 
