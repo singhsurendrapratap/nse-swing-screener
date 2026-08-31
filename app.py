@@ -327,7 +327,6 @@ with tab2:
     else:
         out_sample_pct = st.slider("Out-of-sample size (most recent %, held out)", 20, 50, 35, 5)
         split_date_input = None
-    if st.button("🧪 Run walk-forward validation"):
         if st.button("🧪 Run walk-forward validation"):
         if not universe:
             st.error("Select at least one ticker.")
@@ -346,6 +345,10 @@ with tab2:
                     wf = run_walk_forward_backtest(
                         universe=universe,
                         years=backtest_years,
+                        params=params,
+                        out_sample_frac=float(out_sample_pct / 100)
+                    )
+
                         params=params,
                         out_sample_frac=float(out_sample_pct / 100)
                     )
