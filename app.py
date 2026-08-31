@@ -24,7 +24,7 @@ from engine import (
     evaluate_positions,
 )
 
-APP_VERSION = "app-2026-08-30-b-walkforward"
+APP_VERSION = "app-2026-08-31-c-calendarsplit"
 
 POSITIONS_FILE = "positions.csv"
 POSITIONS_COLS = ["Symbol", "Entry Date", "Entry Price", "Qty", "Stop", "Target"]
@@ -310,11 +310,23 @@ with tab2:
         "period that plays no part in how these settings were chosen. If performance "
         "holds up on the untouched later period, that's real evidence, not a lucky fit."
     )
-    out_sample_pct = st.slider(
-        "Out-of-sample size (most recent %, held out)", 20, 50, 35, 5,
-        help="35% is a reasonable default: enough history to tune on, enough held out to "
-             "actually test against.",
+    split_mode = st.radio(
+        "Split method", ["Fixed calendar date (comparable across runs)", "% of trades (floats with window length)"],
+        index=0,
+        help="Fixed date lets you compare a 3-year and 5-year backtest on the SAME "
+             "out-of-sample period. % split is quicker but the cutoff moves depending "
+             "on how many years you backtest, so results aren't directly comparable.",
     )
+    if split_mode.startswith("Fixed"):
+        split_date_input = st.date_input(
+            "Out-of-sample starts on", value=date(2025, 1, 1),
+            help="Everything before this date is in-sample (tuned on). Everything "
+                 "from this date onward is out-of-sample (untouched, the real test).",
+        )
+        out_sample_pct = None
+    else:
+        out_sample_pct = st.slider("Out-of-sample size (most recent %, held out)", 20, 50, 35, 5)
+        split_date_input = None
     if st.button("🧪 Run walk-forward validation"):
         if not universe:
             st.error("Select at least one ticker.")
@@ -322,7 +334,12 @@ with tab2:
             st.error("Fix the exit settings first.")
         else:
             with st.spinner(f"Generating trades across {backtest_years} years, then splitting..."):
-                wf = run_walk_forward_backtest(universe, backtest_years, params, out_sample_pct / 100)
+                if split_date_input:
+                    wf = run_walk_forward_backtest(universe, backtest_years, params,
+                                                    split_date=split_date_input.isoformat())
+                else:
+                    wf = run_walk_forward_backtest(universe, backtest_years, params,
+                                                    out_sample_frac=out_sample_pct / 100)
 
             if not wf.get("in_sample") or not wf.get("out_sample"):
                 st.info("Not enough trades in this window to split meaningfully -- widen years or universe.")
@@ -462,4 +479,3 @@ st.caption(
 )
 st.caption(f"Build check: `{APP_VERSION}` (app) / `{ENGINE_VERSION}` (engine) -- "
            f"if this doesn't match what you just pasted, the redeploy didn't take.")
-
