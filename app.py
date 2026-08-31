@@ -327,7 +327,7 @@ with tab2:
     else:
         out_sample_pct = st.slider("Out-of-sample size (most recent %, held out)", 20, 50, 35, 5)
         split_date_input = None
-        if st.button("🧪 Run walk-forward validation"):
+            if st.button("🧪 Run walk-forward validation"):
         if not universe:
             st.error("Select at least one ticker.")
         elif partial_r <= breakeven_r:
@@ -349,9 +349,6 @@ with tab2:
                         out_sample_frac=float(out_sample_pct / 100)
                     )
 
-                        params=params,
-                        out_sample_frac=float(out_sample_pct / 100)
-                    )
 
 
             if not wf.get("in_sample") or not wf.get("out_sample"):
