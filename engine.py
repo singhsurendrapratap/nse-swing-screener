@@ -605,15 +605,23 @@ def run_backtest(universe, years, params, return_candidates=False) -> tuple[pd.D
     return trades_df, _summarize_trades(trades_df, params)
 
 
-def run_walk_forward_backtest(universe, years, params, out_sample_frac: float = 0.35, split_date: str = None) -> dict:
+def run_walk_forward_backtest(universe, years, params, out_sample_frac: float = 0.35, split_date=None) -> dict:
     trades_df = _generate_all_trades(universe, years, params)
-    if trades_df.empty or len(trades_df) < 10:
-        return {"trades_df": trades_df, "in_sample": {}, "out_sample": {}, "split_date": None}
+
+    if trades_df.empty or len(trades_df) < 2:
+        return {
+            "trades_df": pd.DataFrame(),
+            "in_sample_df": pd.DataFrame(),
+            "out_sample_df": pd.DataFrame(),
+            "in_sample": {},
+            "out_sample": {},
+            "split_date": pd.to_datetime(split_date) if split_date else pd.Timestamp.now(),
+        }
 
     trades_df["entry_date"] = pd.to_datetime(trades_df["entry_date"])
     trades_df = trades_df.sort_values("entry_date").reset_index(drop=True)
 
-    if split_date:
+    if split_date is not None:
         cutoff = pd.to_datetime(split_date)
         in_sample_df = trades_df[trades_df["entry_date"] < cutoff].reset_index(drop=True)
         out_sample_df = trades_df[trades_df["entry_date"] >= cutoff].reset_index(drop=True)
