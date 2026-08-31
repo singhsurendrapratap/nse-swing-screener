@@ -327,7 +327,8 @@ with tab2:
     else:
         out_sample_pct = st.slider("Out-of-sample size (most recent %, held out)", 20, 50, 35, 5)
         split_date_input = None
-            if st.button("🧪 Run walk-forward validation"):
+
+    if st.button("🧪 Run walk-forward validation"):
         if not universe:
             st.error("Select at least one ticker.")
         elif partial_r <= breakeven_r:
@@ -349,143 +350,73 @@ with tab2:
                         out_sample_frac=float(out_sample_pct / 100)
                     )
 
-
-
-            if not wf.get("in_sample") or not wf.get("out_sample"):
-                st.info("Not enough trades in this window to split meaningfully -- widen years or universe.")
-            else:
-                ins, oos = wf["in_sample"], wf["out_sample"]
-                st.caption(f"Split point: **{wf['split_date'].date()}** -- everything before is in-sample, "
-                           f"everything from that date onward is out-of-sample.")
+            if wf:
+                in_s = wf["in_sample"]
+                out_s = wf["out_sample"]
 
                 col_in, col_out = st.columns(2)
                 with col_in:
-                    st.markdown("**In-sample (earlier, tuned on)**")
-                    st.metric("Trades", ins.get("total_trades", 0))
-                    st.metric("Win rate", f"{ins.get('win_rate', 0):.1f}%")
-                    st.metric("Expectancy", f"{ins.get('expectancy_r', 0):.2f}R")
-                    pf_in = ins.get("profit_factor", 0)
-                    st.metric("Profit factor", f"{pf_in:.2f}" if isinstance(pf_in, (int, float)) else str(pf_in))
+                    st.markdown("### 🟢 In-Sample (Training)")
+                    st.write(f"**Split Date:** Before {wf['split_date']}")
+                    st.metric("Trades", in_s.get("total_trades", 0))
+                    st.metric("Win Rate", f"{in_s.get('win_rate', 0.0):.1f}%")
+                    st.metric("Expectancy", f"{in_s.get('expectancy_r', 0.0):.2f}R")
+                    st.metric("Total R", f"{in_s.get('total_r', 0.0):.2f}R")
+
                 with col_out:
-                    st.markdown("**Out-of-sample (later, untouched)**")
-                    st.metric("Trades", oos.get("total_trades", 0))
-                    st.metric("Win rate", f"{oos.get('win_rate', 0):.1f}%")
-                    st.metric("Expectancy", f"{oos.get('expectancy_r', 0):.2f}R")
-                    pf_out = oos.get("profit_factor", 0)
-                    st.metric("Profit factor", f"{pf_out:.2f}" if isinstance(pf_out, (int, float)) else str(pf_out))
-
-                exp_in = ins.get("expectancy_r", 0)
-                exp_out = oos.get("expectancy_r", 0)
-                if oos.get("total_trades", 0) < 15:
-                    st.warning(
-                        f"Only {oos.get('total_trades', 0)} out-of-sample trades -- too few to "
-                        "draw a real conclusion either way. Widen backtest years or the universe."
-                    )
-                elif exp_out >= exp_in - 0.05:
-                    st.success(
-                        "Out-of-sample expectancy holds up close to (or above) in-sample. "
-                        "That's a real, if modest, sign this generalizes rather than being fit "
-                        "to noise in the tuning window."
-                    )
-                else:
-                    st.error(
-                        f"Out-of-sample expectancy ({exp_out:.2f}R) is meaningfully worse than "
-                        f"in-sample ({exp_in:.2f}R). That's the signature of overfitting -- the "
-                        "settings were likely fit to noise in the earlier period, not a real, "
-                        "durable edge. Treat this configuration with real skepticism."
-                    )
-
-                st.download_button(
-                    "⬇️ Download walk-forward trade data (tagged in/out-of-sample)",
-                    wf["trades_df"].assign(
-                        sample=lambda d: ["in_sample"] * len(wf["in_sample_df"]) + ["out_sample"] * len(wf["out_sample_df"])
-                    ).to_csv(index=False),
-                    file_name="walk_forward_backtest.csv",
-                    mime="text/csv",
-                )
-
-    st.caption(
-        "The diagnostic CSV is intentionally detailed. Its purpose is to let us "
-        "study which characteristics separate winners from losers instead of "
-        "blindly optimizing indicator thresholds."
-    )
+                    st.markdown("### 🔵 Out-Of-Sample (Validation)")
+                    st.write(f"**Split Date:** On/After {wf['split_date']}")
+                    st.metric("Trades", out_s.get("total_trades", 0))
+                    st.metric("Win Rate", f"{out_s.get('win_rate', 0.0):.1f}%")
+                    st.metric("Expectancy", f"{out_s.get('expectancy_r', 0.0):.2f}R")
+                    st.metric("Total R", f"{out_s.get('total_r', 0.0):.2f}R")
 
 # -----------------------------------------------------------------------------
-# POSITIONS
+# MY POSITIONS
 # -----------------------------------------------------------------------------
 with tab3:
-    st.subheader("Track open positions")
-    st.write("Add a position once. Refresh to get a live stop/trailing recommendation.")
+    st.subheader("Track active positions")
+    pos_df = load_positions()
 
-    positions = load_positions()
-
-    with st.form("add_position", clear_on_submit=True):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            symbol = st.text_input("Symbol (e.g. RELIANCE)").strip().upper()
-            entry_date = st.date_input("Entry date", value=date.today())
-        with c2:
-            entry_price = st.number_input("Entry price (Rs)", min_value=0.0, step=0.5)
-            qty = st.number_input("Qty", min_value=1, step=1)
-        with c3:
-            stop = st.number_input("Initial stop (Rs)", min_value=0.0, step=0.5)
-            target = st.number_input("Partial target (Rs)", min_value=0.0, step=0.5)
-        submitted = st.form_submit_button("➕ Add position")
-        if submitted and symbol and entry_price > 0:
+    with st.form("add_position_form"):
+        st.write("Add New Position")
+        col1, col2, col3 = st.columns(3)
+        sym = col1.text_input("Symbol (e.g. RELIANCE.NS)")
+        entry_d = col2.date_input("Entry Date", value=date.today())
+        entry_p = col3.number_input("Entry Price", min_value=0.0, value=0.0)
+        
+        col4, col5, col6 = st.columns(3)
+        qty = col4.number_input("Quantity", min_value=1, value=1)
+        stop = col5.number_input("Stop Price", min_value=0.0, value=0.0)
+        target = col6.number_input("Target Price", min_value=0.0, value=0.0)
+        
+        submitted = st.form_submit_button("Add Position")
+        if submitted and sym:
             new_row = pd.DataFrame([{
-                "Symbol": symbol,
-                "Entry Date": entry_date.isoformat(),
-                "Entry Price": entry_price,
+                "Symbol": sym.upper().strip(),
+                "Entry Date": str(entry_d),
+                "Entry Price": entry_p,
                 "Qty": qty,
                 "Stop": stop,
-                "Target": target,
+                "Target": target
             }])
-            positions = pd.concat([positions, new_row], ignore_index=True)
-            save_positions(positions)
-            st.success(f"Added {symbol}.")
+            pos_df = pd.concat([pos_df, new_row], ignore_index=True)
+            save_positions(pos_df)
+            st.success(f"Added {sym.upper()}")
             st.rerun()
 
-    st.divider()
-    if positions.empty:
-        st.info("No open positions tracked yet.")
+    if pos_df.empty:
+        st.info("No active positions tracked.")
     else:
-        if st.button("🔄 Refresh position signals", type="primary"):
-            with st.spinner("Fetching latest prices..."):
-                status_df = evaluate_positions(positions, params)
-            st.session_state["position_status"] = status_df
+        st.dataframe(pos_df, use_container_width=True, hide_index=True)
+        if st.button("Evaluate Positions"):
+            eval_results = evaluate_positions(pos_df)
+            st.dataframe(eval_results, use_container_width=True)
 
-        if "position_status" in st.session_state:
-            status_df = st.session_state["position_status"]
-
-            def _highlight(row):
-                signal = str(row.get("Signal", ""))
-                if "SELL" in signal:
-                    return ["background-color: #ffdddd"] * len(row)
-                if "CONSIDER" in signal:
-                    return ["background-color: #fff6cc"] * len(row)
-                return [""] * len(row)
-
-            st.dataframe(
-                status_df.style.apply(_highlight, axis=1),
-                use_container_width=True,
-                hide_index=True,
-            )
-        else:
-            st.info("Click Refresh position signals.")
-
-        st.divider()
-        to_remove = st.selectbox("Closed position to remove", options=[""] + positions["Symbol"].tolist())
-        if st.button("🗑️ Remove") and to_remove:
-            positions = positions[positions["Symbol"] != to_remove]
-            save_positions(positions)
-            st.session_state.pop("position_status", None)
-            st.success(f"Removed {to_remove}.")
+        if st.button("Clear All Positions"):
+            save_positions(pd.DataFrame(columns=POSITIONS_COLS))
+            st.success("Cleared all positions.")
             st.rerun()
 
-st.divider()
-st.caption(
-    "Educational research tool, not investment advice. A positive backtest is not proof "
-    "of future profitability. Use out-of-sample / walk-forward validation before risking money."
-)
-st.caption(f"Build check: `{APP_VERSION}` (app) / `{ENGINE_VERSION}` (engine) -- "
-           f"if this doesn't match what you just pasted, the redeploy didn't take.")
+st.sidebar.divider()
+st.sidebar.caption(f"App Version: {APP_VERSION} | Engine Version: {ENGINE_VERSION}")
