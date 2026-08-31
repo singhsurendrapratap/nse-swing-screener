@@ -22,7 +22,7 @@ this session, ENGINE_VERSION below exists specifically so you can confirm a
 redeploy actually took -- check the sidebar footer against this string.
 """
 
-ENGINE_VERSION = "engine-2026-08-30-a"
+ENGINE_VERSION = "engine-2026-08-30-b-walkforward"
 
 import pandas as pd
 import numpy as np
@@ -549,7 +549,11 @@ def _extract_symbol_frame(data: pd.DataFrame, sym: str, universe_len: int) -> pd
         return pd.DataFrame()
 
 
-def run_backtest(universe, years, params, return_candidates=False) -> tuple[pd.DataFrame, dict]:
+def _generate_all_trades(universe, years, params) -> pd.DataFrame:
+    """Core trade generation, shared by run_backtest and the walk-forward split.
+    Indicators need continuous lookback history, so this always runs across the
+    FULL requested window -- splitting into in-sample/out-of-sample happens
+    afterward, on the resulting trades, not by truncating the price history."""
     start = (datetime.now() - timedelta(days=365 * years + 260)).strftime("%Y-%m-%d")
     nifty_df = get_nifty_data(start)
     market_regime = get_market_regime(nifty_df)
@@ -577,10 +581,8 @@ def run_backtest(universe, years, params, return_candidates=False) -> tuple[pd.D
 
     trades_df = pd.DataFrame(all_trades)
     if trades_df.empty:
-        return trades_df, {}
+        return trades_df
 
-    # Enforce the "trade less" rule across the whole universe.
-    # Pick only the highest-quality setups on each signal day.
     if "signal_date" in trades_df.columns:
         trades_df["signal_date"] = pd.to_datetime(trades_df["signal_date"])
         trades_df = (
@@ -590,12 +592,17 @@ def run_backtest(universe, years, params, return_candidates=False) -> tuple[pd.D
             .sort_values("entry_date")
             .reset_index(drop=True)
         )
+    return trades_df.sort_values("entry_date").reset_index(drop=True)
 
+
+def _summarize_trades(trades_df: pd.DataFrame, params: dict) -> dict:
+    if trades_df.empty:
+        return {}
     wins = trades_df[trades_df.outcome == "win"]
     losses = trades_df[trades_df.outcome == "loss"]
     gross_win = wins.r_multiple.sum() if len(wins) else 0
     gross_loss_abs = abs(losses.r_multiple.sum()) if len(losses) else 0
-    summary = {
+    return {
         "total_trades": len(trades_df),
         "win_rate": len(wins) / len(trades_df) * 100,
         "avg_win_r": wins.r_multiple.mean() if len(wins) else 0,
@@ -607,7 +614,44 @@ def run_backtest(universe, years, params, return_candidates=False) -> tuple[pd.D
         "max_loss_streak": _max_streak((trades_df.outcome == "loss").tolist()),
         "parameters": {k: params[k] for k in params},
     }
-    return trades_df.sort_values("entry_date").reset_index(drop=True), summary
+
+
+def run_backtest(universe, years, params, return_candidates=False) -> tuple[pd.DataFrame, dict]:
+    trades_df = _generate_all_trades(universe, years, params)
+    return trades_df, _summarize_trades(trades_df, params)
+
+
+def run_walk_forward_backtest(universe, years, params, out_sample_frac: float = 0.35) -> dict:
+    """
+    Splits the SAME set of generated trades chronologically into an in-sample
+    (earlier) period and an out-of-sample (later) period, using the exact same
+    frozen params for both -- nothing is re-tuned per half. If the out-of-sample
+    half performs meaningfully worse than in-sample, that's a real warning sign
+    the earlier tuning was fitting to noise in that specific window rather than
+    finding something that generalizes.
+    """
+    trades_df = _generate_all_trades(universe, years, params)
+    if trades_df.empty or len(trades_df) < 10:
+        return {"trades_df": trades_df, "in_sample": {}, "out_sample": {}, "split_date": None}
+
+    trades_df["entry_date"] = pd.to_datetime(trades_df["entry_date"])
+    trades_df = trades_df.sort_values("entry_date").reset_index(drop=True)
+
+    split_idx = int(len(trades_df) * (1 - out_sample_frac))
+    split_idx = max(1, min(split_idx, len(trades_df) - 1))  # keep both halves non-empty
+    split_date = trades_df.iloc[split_idx]["entry_date"]
+
+    in_sample_df = trades_df.iloc[:split_idx].reset_index(drop=True)
+    out_sample_df = trades_df.iloc[split_idx:].reset_index(drop=True)
+
+    return {
+        "trades_df": trades_df,
+        "in_sample_df": in_sample_df,
+        "out_sample_df": out_sample_df,
+        "in_sample": _summarize_trades(in_sample_df, params),
+        "out_sample": _summarize_trades(out_sample_df, params),
+        "split_date": split_date,
+    }
 
 
 def _max_streak(values):
