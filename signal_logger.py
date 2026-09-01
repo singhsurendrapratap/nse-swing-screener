@@ -1,121 +1,154 @@
-"""
-Automatic Daily Signal Logger
-------------------------------
-Purpose: build a genuine forward track record automatically, without
-ever having to remember to save anything.
-
-Call `log_todays_signals()` once per day (e.g. at market close, via a
-scheduled job or the first Streamlit run of the day) and it will:
-  1. Take whatever signals your strategy generated today
-  2. Store them with a stable (date, symbol) key so re-runs never duplicate
-  3. Leave "outcome" fields empty until the trade actually resolves
-
-Call `update_open_outcomes()` on each run to fill in realized R for
-signals that have since hit target/stop/time-exit, so the track record
-fills itself in going forward without manual entry.
-"""
-
 import sqlite3
-import json
 from datetime import date
 import pandas as pd
 
-DB_PATH = "signal_log.db"
-
-
-def _conn():
-    return sqlite3.connect(DB_PATH)
+DB_FILE = "signal_log.db"
 
 
 def init_db():
-    with _conn() as c:
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS signals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            log_date TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            entry REAL,
-            stop REAL,
-            target REAL,
-            quality_score REAL,
-            params_json TEXT,
-            status TEXT DEFAULT 'open',   -- open / win / loss / expired
-            realized_r REAL,
-            closed_date TEXT,
-            UNIQUE(log_date, symbol)
+    """Initializes the SQLite database table for signal tracking."""
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS signal_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_date TEXT,
+                symbol TEXT,
+                score REAL,
+                close_price REAL,
+                atr REAL,
+                recommended_stop REAL,
+                recommended_target REAL,
+                recommended_qty INTEGER,
+                params_hash TEXT,
+                outcome_status TEXT DEFAULT 'OPEN',
+                exit_price REAL,
+                exit_date TEXT,
+                r_multipler REAL,
+                UNIQUE(signal_date, symbol)
+            )
+            """
         )
-        """)
 
 
-def log_todays_signals(signals_df: pd.DataFrame, params: dict):
-    """
-    signals_df columns expected: symbol, entry, stop, target, quality_score
-    params: the strategy parameters active today. Worth storing per-signal
-    so that once you're running AI-optimized params that change over time,
-    you can trace exactly which parameter set produced which signal.
-    """
+def log_todays_signals(watchlist_df: pd.DataFrame, params: dict):
+    """Logs new candidates to the database."""
     init_db()
-    today = date.today().isoformat()
-    with _conn() as c:
-        for _, row in signals_df.iterrows():
-            try:
-                c.execute("""
-                    INSERT INTO signals
-                    (log_date, symbol, entry, stop, target, quality_score, params_json)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (today, row["symbol"], row["entry"], row["stop"],
-                      row["target"], row["quality_score"], json.dumps(params)))
-            except sqlite3.IntegrityError:
-                pass  # already logged today for this symbol -- no duplicates
+    if watchlist_df.empty:
+        return
 
+    params_hash = str(sorted(params.items()))
+    today_str = str(date.today())
 
-def update_open_outcomes(price_lookup_fn, max_hold_days: int = None):
-    """
-    price_lookup_fn(symbol) -> latest price.
-    Walks every still-open signal and closes it out if price has hit
-    stop or target (extend with your own time-exit / trailing logic
-    as needed). This is what makes the track record forward and
-    unattended -- you never manually mark a trade won or lost.
-    """
-    init_db()
-    today = date.today().isoformat()
-    with _conn() as c:
-        open_rows = c.execute(
-            "SELECT id, symbol, entry, stop, target FROM signals WHERE status='open'"
-        ).fetchall()
-        for sid, symbol, entry, stop, target in open_rows:
-            price = price_lookup_fn(symbol)
-            if price is None:
-                continue
-            risk = abs(entry - stop) or 1e-9
-            if price <= stop:
-                c.execute(
-                    "UPDATE signals SET status='loss', realized_r=?, closed_date=? WHERE id=?",
-                    (-1.0, today, sid)
-                )
-            elif price >= target:
-                r = (target - entry) / risk
-                c.execute(
-                    "UPDATE signals SET status='win', realized_r=?, closed_date=? WHERE id=?",
-                    (r, today, sid)
-                )
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        for _, row in watchlist_df.iterrows():
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO signal_log (
+                    signal_date, symbol, score, close_price, atr,
+                    recommended_stop, recommended_target, recommended_qty, params_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    today_str,
+                    row.get("Symbol"),
+                    row.get("Score"),
+                    row.get("Close"),
+                    row.get("ATR"),
+                    row.get("Stop"),
+                    row.get("Target"),
+                    row.get("Position Size (Qty)"),
+                    params_hash,
+                ),
+            )
+        conn.commit()
 
 
 def get_track_record() -> pd.DataFrame:
+    """Fetches all stored signals from the SQLite database."""
     init_db()
-    with _conn() as c:
-        return pd.read_sql("SELECT * FROM signals ORDER BY log_date DESC", c)
+    with sqlite3.connect(DB_FILE) as conn:
+        return pd.read_sql_query(
+            "SELECT * FROM signal_log ORDER BY signal_date DESC", conn
+        )
+
+
+def update_open_outcomes(live_price_fetcher):
+    """Updates open positions using a price-fetching callback."""
+    init_db()
+    with sqlite3.connect(DB_FILE) as conn:
+        df = pd.read_sql_query(
+            "SELECT * FROM signal_log WHERE outcome_status = 'OPEN'", conn
+        )
+        if df.empty:
+            return
+
+        cursor = conn.cursor()
+        for _, row in df.iterrows():
+            sym = row["symbol"]
+            entry_p = row["close_price"]
+            stop_p = row["recommended_stop"]
+            target_p = row["recommended_target"]
+            row_id = row["id"]
+
+            curr_price = live_price_fetcher(sym)
+            if curr_price is None:
+                continue
+
+            r_unit = entry_p - stop_p
+            if r_unit <= 0:
+                continue
+
+            # Check target and stop conditions
+            if curr_price >= target_p:
+                r_mult = (target_p - entry_p) / r_unit
+                cursor.execute(
+                    """
+                    UPDATE signal_log
+                    SET outcome_status = 'CLOSED_TARGET', exit_price = ?, exit_date = ?, r_multipler = ?
+                    WHERE id = ?
+                    """,
+                    (target_p, str(date.today()), r_mult, row_id),
+                )
+            elif curr_price <= stop_p:
+                r_mult = (stop_p - entry_p) / r_unit
+                cursor.execute(
+                    """
+                    UPDATE signal_log
+                    SET outcome_status = 'CLOSED_STOP', exit_price = ?, exit_date = ?, r_multipler = ?
+                    WHERE id = ?
+                    """,
+                    (stop_p, str(date.today()), r_mult, row_id),
+                )
+        conn.commit()
 
 
 def summary_stats() -> dict:
-    """Quick forward-track-record stats -- the real, unfaked win rate."""
-    df = get_track_record()
-    closed = df[df["status"].isin(["win", "loss"])]
-    if closed.empty:
-        return {"n_trades": 0}
+    """Calculates summary statistics across all closed signals."""
+    init_db()
+    with sqlite3.connect(DB_FILE) as conn:
+        df = pd.read_sql_query(
+            "SELECT * FROM signal_log WHERE outcome_status != 'OPEN'", conn
+        )
+
+    if df.empty:
+        return {
+            "n_trades": 0,
+            "win_rate": 0.0,
+            "expectancy_r": 0.0,
+            "total_r": 0.0,
+        }
+
+    n_trades = len(df)
+    wins = (df["r_multipler"] > 0).sum()
+    win_rate = wins / n_trades
+    total_r = df["r_multipler"].sum()
+    expectancy_r = df["r_multipler"].mean()
+
     return {
-        "n_trades": len(closed),
-        "win_rate": (closed["status"] == "win").mean(),
-        "expectancy_r": closed["realized_r"].mean(),
-        "total_r": closed["realized_r"].sum(),
+        "n_trades": n_trades,
+        "win_rate": win_rate,
+        "expectancy_r": expectancy_r,
+        "total_r": total_r,
     }
