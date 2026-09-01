@@ -23,7 +23,7 @@ from signal_logger import (
     update_open_outcomes,
 )
 
-APP_VERSION = "app-2026-08-31-c-calendarsplit"
+APP_VERSION = "app-2026-09-01-analytics-v3"
 POSITIONS_FILE = "positions.csv"
 POSITIONS_COLS = ["Symbol", "Entry Date", "Entry Price", "Qty", "Stop", "Target"]
 
@@ -181,14 +181,28 @@ with tab2:
         with st.spinner("Executing historical simulation..."):
             trades_df, summary = run_backtest(universe, backtest_years, active_params)
 
-        if not summary:
+        if not summary or trades_df.empty:
             st.info("No trades found in selected parameters.")
         else:
+            # Primary Metrics Row
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Trades", summary.get("total_trades", 0))
+            c1.metric("Total Trades", summary.get("total_trades", 0))
             c2.metric("Win Rate", f"{summary.get('win_rate', 0.0):.1f}%")
             c3.metric("Expectancy", f"{summary.get('expectancy_r', 0.0):.2f}R")
-            c4.metric("Total R", f"{summary.get('total_r', 0.0):.2f}R")
+            c4.metric("Total Return", f"{summary.get('total_r', 0.0):.2f}R")
+
+            # Risk/Reward Analytics Row
+            a1, a2, a3 = st.columns(3)
+            a1.metric("Profit Factor", f"{summary.get('profit_factor', 0.0):.2f}")
+            a2.metric("Max Drawdown", f"{summary.get('max_drawdown_r', 0.0):.2f}R")
+            a3.metric("Avg Win / Avg Loss", f"{summary.get('avg_win_r', 0.0):.2f}R / {summary.get('avg_loss_r', 0.0):.2f}R")
+
+            st.divider()
+            st.subheader("📈 Cumulative Equity Curve (R-Multiple Return)")
+            curve_df = trades_df.set_index("entry_date")[["cum_r"]]
+            st.line_chart(curve_df)
+
+            st.subheader("📋 Executed Trade Log")
             st.dataframe(trades_df, use_container_width=True, hide_index=True)
 
     st.divider()
@@ -204,10 +218,12 @@ with tab2:
                 st.markdown("### 🟢 In-Sample")
                 st.write(f"Trades: {wf['in_sample'].get('total_trades', 0)}")
                 st.write(f"Expectancy: {wf['in_sample'].get('expectancy_r', 0.0):.2f}R")
+                st.write(f"Total R: {wf['in_sample'].get('total_r', 0.0):.2f}R")
             with col_out:
                 st.markdown("### 🔵 Out-Of-Sample")
                 st.write(f"Trades: {wf['out_sample'].get('total_trades', 0)}")
                 st.write(f"Expectancy: {wf['out_sample'].get('expectancy_r', 0.0):.2f}R")
+                st.write(f"Total R: {wf['out_sample'].get('total_r', 0.0):.2f}R")
 
 with tab3:
     st.subheader("Manage Active Positions")
