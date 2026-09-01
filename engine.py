@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-ENGINE_VERSION = "engine-2026-08-31-v2"
+ENGINE_VERSION = "engine-2026-09-01-analytics-v3"
 
 DEFAULT_UNIVERSE = [
     "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS",
@@ -30,19 +30,16 @@ DEFAULT_PARAMS = {
 
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculates technical indicators including EMA, ATR, RSI, and Volume metrics."""
     df = df.copy()
     close = df["Close"]
     high = df["High"]
     low = df["Low"]
     volume = df["Volume"]
 
-    # Moving averages
     df["EMA20"] = close.ewm(span=20, adjust=False).mean()
     df["EMA50"] = close.ewm(span=50, adjust=False).mean()
     df["SMA200"] = close.rolling(window=200).mean()
 
-    # Average True Range (ATR)
     tr = np.maximum(
         high - low,
         np.maximum(
@@ -52,14 +49,12 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     )
     df["ATR"] = tr.rolling(window=14).mean()
 
-    # Relative Strength Index (RSI)
     delta = close.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / (loss + 1e-9)
     df["RSI"] = 100 - (100 / (1 + rs))
 
-    # Volume and Volatility metrics
     df["Vol20"] = volume.rolling(window=20).mean()
     df["VolRatio"] = volume / (df["Vol20"] + 1e-9)
     df["High20"] = high.rolling(window=20).max()
@@ -70,59 +65,39 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_score(row: pd.Series, params: dict) -> float:
-    """Calculates quality setup score (0 to 100)."""
     score = 0.0
+    if row["Close"] > row["EMA20"]: score += 10
+    if row["EMA20"] > row["EMA50"]: score += 10
+    if pd.notna(row["SMA200"]) and row["Close"] > row["SMA200"]: score += 10
 
-    # Trend alignment (Max 30 pts)
-    if row["Close"] > row["EMA20"]:
-        score += 10
-    if row["EMA20"] > row["EMA50"]:
-        score += 10
-    if pd.notna(row["SMA200"]) and row["Close"] > row["SMA200"]:
-        score += 10
+    if row["Close"] >= row["High20"] * 0.99: score += 15
+    if row["Contraction"] < 0.12: score += 15
 
-    # Breakout & Volatility Contraction (Max 30 pts)
-    if row["Close"] >= row["High20"] * 0.99:
-        score += 15
-    if row["Contraction"] < 0.12:
-        score += 15
+    if row["VolRatio"] > 1.5: score += 20
+    elif row["VolRatio"] > 1.0: score += 10
 
-    # Volume Confirmation (Max 20 pts)
-    if row["VolRatio"] > 1.5:
-        score += 20
-    elif row["VolRatio"] > 1.0:
-        score += 10
-
-    # RSI Sanity Check (Max 20 pts)
     rsi_low = params.get("rsi_low", 45)
     rsi_high = params.get("rsi_high", 70)
-    if rsi_low <= row["RSI"] <= rsi_high:
-        score += 20
+    if rsi_low <= row["RSI"] <= rsi_high: score += 20
 
     return min(score, 100.0)
 
 
 def download_data(symbol: str, years: int) -> pd.DataFrame:
-    """Downloads historical ticker data from Yahoo Finance."""
     try:
         df = yf.download(symbol, period=f"{years}y", progress=False)
-        if df.empty or len(df) < 200:
-            return pd.DataFrame()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+        if df.empty or len(df) < 200: return pd.DataFrame()
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
         return compute_indicators(df)
     except Exception:
         return pd.DataFrame()
 
 
 def check_market_regime() -> bool:
-    """Checks if overall market regime (Nifty 50) is bullish."""
     try:
         nifty = yf.download("^NSEI", period="1y", progress=False)
-        if nifty.empty:
-            return True
-        if isinstance(nifty.columns, pd.MultiIndex):
-            nifty.columns = nifty.columns.get_level_values(0)
+        if nifty.empty: return True
+        if isinstance(nifty.columns, pd.MultiIndex): nifty.columns = nifty.columns.get_level_values(0)
         nifty = compute_indicators(nifty)
         last = nifty.iloc[-1]
         return bool(last["Close"] > last["EMA20"] and last["Close"] > last["EMA50"])
@@ -131,14 +106,12 @@ def check_market_regime() -> bool:
 
 
 def screen_today(universe: list, capital: float, risk_pct: float, params: dict):
-    """Screens universe for today's highest-quality trading setups."""
     market_bullish = check_market_regime()
     watchlist = []
 
     for sym in universe:
         df = download_data(sym, 1)
-        if df.empty:
-            continue
+        if df.empty: continue
         last = df.iloc[-1]
         score = compute_score(last, params)
 
@@ -147,8 +120,7 @@ def screen_today(universe: list, capital: float, risk_pct: float, params: dict):
             close = last["Close"]
             stop = close - (atr * params.get("atr_stop_mult", 1.5))
             risk_per_share = close - stop
-            if risk_per_share <= 0:
-                continue
+            if risk_per_share <= 0: continue
 
             max_risk_amount = capital * risk_pct
             qty = max(1, int(max_risk_amount / risk_per_share))
@@ -172,13 +144,11 @@ def screen_today(universe: list, capital: float, risk_pct: float, params: dict):
 
 
 def run_backtest(universe: list, years: int, params: dict):
-    """Executes a full historical multi-stock backtest simulation."""
     all_trades = []
 
     for sym in universe:
         df = download_data(sym, years)
-        if df.empty:
-            continue
+        if df.empty: continue
 
         for i in range(200, len(df) - 1):
             row = df.iloc[i]
@@ -191,10 +161,8 @@ def run_backtest(universe: list, years: int, params: dict):
                 stop_dist = atr * params.get("atr_stop_mult", 1.5)
                 stop_price = entry_price - stop_dist
 
-                if stop_dist <= 0:
-                    continue
+                if stop_dist <= 0: continue
 
-                # Simulate position progression
                 hold_days = params.get("hold_days", 20)
                 exit_price = entry_price
                 exit_date = entry_date
@@ -210,26 +178,41 @@ def run_backtest(universe: list, years: int, params: dict):
                         exit_date = df.index[j]
 
                 r_mult = (exit_price - entry_price) / stop_dist
-                # Apply friction penalty
                 r_mult -= params.get("friction_pct", 0.0015)
 
                 all_trades.append({
                     "symbol": sym,
                     "entry_date": entry_date,
                     "exit_date": exit_date,
-                    "entry_price": entry_price,
-                    "exit_price": exit_price,
-                    "score": score,
-                    "r_multiplier": r_mult,
+                    "entry_price": round(entry_price, 2),
+                    "exit_price": round(exit_price, 2),
+                    "score": round(score, 1),
+                    "r_multiplier": round(r_mult, 2),
                 })
 
     trades_df = pd.DataFrame(all_trades)
-    if trades_df.empty:
-        return trades_df, {}
+    if trades_df.empty: return trades_df, {}
 
+    trades_df["entry_date"] = pd.to_datetime(trades_df["entry_date"])
+    trades_df = trades_df.sort_values("entry_date").reset_index(drop=True)
+    trades_df["cum_r"] = trades_df["r_multiplier"].cumsum()
+
+    # Calculate Drawdown metrics
+    cum = trades_df["cum_r"]
+    peak = cum.cummax()
+    drawdown = cum - peak
+    max_dd = drawdown.min()
+
+    # Calculate Win/Loss statistics
     n_trades = len(trades_df)
-    wins = (trades_df["r_multiplier"] > 0).sum()
-    win_rate = (wins / n_trades) * 100
+    wins = trades_df[trades_df["r_multiplier"] > 0]["r_multiplier"]
+    losses = trades_df[trades_df["r_multiplier"] <= 0]["r_multiplier"]
+
+    gross_profit = wins.sum()
+    gross_loss = abs(losses.sum())
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else gross_profit
+
+    win_rate = (len(wins) / n_trades) * 100
     total_r = trades_df["r_multiplier"].sum()
     expectancy_r = trades_df["r_multiplier"].mean()
 
@@ -238,21 +221,20 @@ def run_backtest(universe: list, years: int, params: dict):
         "win_rate": win_rate,
         "expectancy_r": expectancy_r,
         "total_r": total_r,
+        "profit_factor": profit_factor,
+        "max_drawdown_r": max_dd,
+        "avg_win_r": wins.mean() if not wins.empty else 0.0,
+        "avg_loss_r": losses.mean() if not losses.empty else 0.0,
     }
 
     return trades_df, summary
 
 
 def run_optimizer_backtest(trades_df: pd.DataFrame, params: dict) -> dict:
-    """Fast evaluation of dynamic parameter changes on pre-generated trades."""
-    if trades_df.empty:
-        return {"expectancy_r": -999.0, "total_r": -999.0, "win_rate": 0.0}
-
+    if trades_df.empty: return {"expectancy_r": -999.0, "total_r": -999.0, "win_rate": 0.0}
     filtered = trades_df[trades_df["score"] >= params.get("score_threshold", 78)]
-    if filtered.empty:
-        return {"expectancy_r": -999.0, "total_r": -999.0, "win_rate": 0.0}
+    if filtered.empty: return {"expectancy_r": -999.0, "total_r": -999.0, "win_rate": 0.0}
 
-    # Scale return according to updated ATR multiplier
     base_atr_mult = 1.5
     adj_factor = base_atr_mult / params.get("atr_stop_mult", 1.5)
     adj_r = filtered["r_multiplier"] * adj_factor
@@ -268,20 +250,15 @@ def run_optimizer_backtest(trades_df: pd.DataFrame, params: dict) -> dict:
 
 
 def run_walk_forward_backtest(universe: list, years: int, params: dict, split_date: str) -> dict:
-    """Performs an In-Sample vs Out-of-Sample backtest split validation."""
     trades_df, _ = run_backtest(universe, years, params)
-    if trades_df.empty:
-        return {}
+    if trades_df.empty: return {}
 
-    trades_df["entry_date"] = pd.to_datetime(trades_df["entry_date"])
     split_dt = pd.to_datetime(split_date)
-
     in_sample = trades_df[trades_df["entry_date"] < split_dt]
     out_sample = trades_df[trades_df["entry_date"] >= split_dt]
 
     def get_stats(df_sub):
-        if df_sub.empty:
-            return {"total_trades": 0, "expectancy_r": 0.0, "total_r": 0.0, "win_rate": 0.0}
+        if df_sub.empty: return {"total_trades": 0, "expectancy_r": 0.0, "total_r": 0.0, "win_rate": 0.0}
         n = len(df_sub)
         w = (df_sub["r_multiplier"] > 0).sum()
         return {
@@ -295,15 +272,13 @@ def run_walk_forward_backtest(universe: list, years: int, params: dict, split_da
 
 
 def evaluate_positions(pos_df: pd.DataFrame, params: dict) -> pd.DataFrame:
-    """Evaluates status of manually logged open positions."""
     results = []
     for _, row in pos_df.iterrows():
         sym = str(row["Symbol"]).strip()
         yf_sym = sym if sym.endswith(".NS") else f"{sym}.NS"
         try:
             df = yf.download(yf_sym, period="5d", progress=False)
-            if df.empty:
-                continue
+            if df.empty: continue
             curr_price = float(df["Close"].iloc[-1])
             entry_p = float(row["Entry Price"])
             stop_p = float(row["Stop"])
@@ -311,10 +286,8 @@ def evaluate_positions(pos_df: pd.DataFrame, params: dict) -> pd.DataFrame:
 
             pnl_pct = ((curr_price - entry_p) / entry_p) * 100
             status = "HOLD"
-            if curr_price >= target_p > 0:
-                status = "TARGET HIT"
-            elif curr_price <= stop_p > 0:
-                status = "STOP HIT"
+            if curr_price >= target_p > 0: status = "TARGET HIT"
+            elif curr_price <= stop_p > 0: status = "STOP HIT"
 
             results.append({
                 "Symbol": sym,
