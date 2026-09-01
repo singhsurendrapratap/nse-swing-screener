@@ -1,107 +1,109 @@
-"""
-Walk-Forward AI Parameter Optimizer
-------------------------------------
-Fixes the main risk in a naive "search everything, report the best
-result" optimizer: the best in-sample parameters are usually just the
-ones that happened to overfit the noise in that specific sample.
-
-This version:
-  1. Splits trade history into N walk-forward folds (train -> test,
-     rolling forward through time, with an embargo gap so no
-     information leaks across the boundary).
-  2. Optuna searches parameters guided by TEST (out-of-sample) score,
-     not train score.
-  3. The reported "best" params are the ones with the best MEDIAN
-     out-of-sample score across folds -- not the best single fold,
-     which is too easy to get lucky on.
-  4. If the spread across folds is large relative to the average
-     score, that's flagged as an overfitting warning rather than
-     hidden from you.
-
-Plug your real backtest engine into `run_backtest_fn`.
-"""
-
-import optuna
 import numpy as np
 import pandas as pd
+import optuna
 
+# Suppress verbose Optuna logging output
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
-def make_walk_forward_folds(trade_dates: pd.Series, n_folds: int = 5, embargo_days: int = 5):
-    """Return list of (train_dates, test_dates) rolling forward through time."""
-    dates = np.sort(trade_dates.unique())
-    fold_size = len(dates) // (n_folds + 1)
+def run_ai_optimizer(
+    param_space: dict,
+    trades_df: pd.DataFrame,
+    backtest_fn,
+    target_metric: str = "Expectancy R",
+    min_trades_per_fold: int = 20,
+    n_trials: int = 50,
+    n_folds: int = 5,
+) -> dict:
+    """Runs an Optuna optimization search across chronological walk-forward folds.
+
+    Returns the best parameters and cross-fold stability metrics.
+    """
+    if trades_df is None or trades_df.empty or len(trades_df) < (min_trades_per_fold * 2):
+        return {
+            "best_params": {},
+            "oos_median_score": 0.0,
+            "overfit_warning": False,
+            "overfit_ratio": 1.0,
+            "oos_fold_scores": [],
+        }
+
+    # Sort historical trades chronologically
+    df_sorted = trades_df.sort_values("entry_date").reset_index(drop=True)
+    n = len(df_sorted)
+    fold_size = n // (n_folds + 1)
+
     folds = []
     for i in range(n_folds):
-        train_end = fold_size * (i + 1)
-        test_start = train_end + embargo_days
-        test_end = test_start + fold_size
-        if test_end > len(dates):
-            break
-        folds.append((dates[:train_end], dates[test_start:test_end]))
-    return folds
+        train_end = (i + 1) * fold_size
+        val_end = train_end + fold_size if i < n_folds - 1 else n
+        train_trades = df_sorted.iloc[:train_end]
+        val_trades = df_sorted.iloc[train_end:val_end]
+        folds.append((train_trades, val_trades))
 
+    def objective(trial: optuna.Trial) -> float:
+        # Sample candidate parameters from defined parameter space
+        sampled_params = {}
+        for param, cfg in param_space.items():
+            p_type = cfg.get("type", "float")
+            if p_type == "float":
+                sampled_params[param] = trial.suggest_float(
+                    param, cfg["low"], cfg["high"], step=cfg.get("step")
+                )
+            elif p_type == "int":
+                sampled_params[param] = trial.suggest_int(
+                    param, cfg["low"], cfg["high"], step=cfg.get("step", 1)
+                )
 
-def _metric_key(target_metric: str) -> str:
-    return target_metric.lower().replace(" ", "_").replace("-", "_")
+        val_scores = []
+        for train_trades, val_trades in folds:
+            if len(train_trades) < min_trades_per_fold or len(val_trades) < 5:
+                continue
 
+            # Run light evaluation function provided by engine
+            res = backtest_fn(val_trades, sampled_params)
 
-def run_ai_optimizer(param_space: dict, trades_df: pd.DataFrame, run_backtest_fn,
-                      target_metric: str, min_trades: int, n_trials: int, n_folds: int = 5):
-    """
-    param_space: e.g. {
-        "initial_stop": {"type": "float", "low": 1.0, "high": 4.0, "step": 0.1},
-        "min_quality":  {"type": "int",   "low": 50,  "high": 90},
-    }
-    run_backtest_fn(params, trades_df) -> dict with at least
-        {'win_rate':.., 'expectancy_r':.., 'total_r':.., 'n_trades':..}
-    """
-    folds = make_walk_forward_folds(trades_df["date"], n_folds=n_folds)
-    if not folds:
-        raise ValueError("Not enough trade history for walk-forward folds -- lower n_folds.")
+            if target_metric == "Expectancy R":
+                score = res.get("expectancy_r", -999.0)
+            elif target_metric == "Total R":
+                score = res.get("total_r", -999.0)
+            elif target_metric == "Win Rate":
+                score = res.get("win_rate", 0.0)
+            else:
+                score = res.get("expectancy_r", -999.0)
 
-    metric_key = _metric_key(target_metric)
+            val_scores.append(score)
 
-    def objective(trial):
-        params = {}
-        for name, spec in param_space.items():
-            if spec["type"] == "float":
-                params[name] = trial.suggest_float(name, spec["low"], spec["high"], step=spec.get("step"))
-            elif spec["type"] == "int":
-                params[name] = trial.suggest_int(name, spec["low"], spec["high"])
-
-        test_scores = []
-        for train_dates, test_dates in folds:
-            train_df = trades_df[trades_df["date"].isin(train_dates)]
-            test_df = trades_df[trades_df["date"].isin(test_dates)]
-            if len(train_df) < min_trades or len(test_df) < max(5, min_trades // 4):
-                raise optuna.TrialPruned()
-
-            # Train fold is only used implicitly (params are shared across
-            # folds by Optuna's search) -- what we score and optimize on
-            # is always the held-out test fold.
-            test_result = run_backtest_fn(params, test_df)
-            score = test_result.get(metric_key)
-            if score is None:
-                raise optuna.TrialPruned()
-            test_scores.append(score)
-
-        trial.set_user_attr("fold_scores", test_scores)
-        return float(np.median(test_scores))  # robust to one lucky fold
+        return float(np.median(val_scores)) if val_scores else -999.0
 
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=n_trials)
 
-    best = study.best_trial
-    fold_scores = best.user_attrs.get("fold_scores", [])
-    overfit_ratio = float(np.std(fold_scores) / (abs(np.mean(fold_scores)) + 1e-9)) if fold_scores else None
+    best_params = study.best_params
+    best_value = study.best_value
+
+    # Compute Out-Of-Sample (OOS) performance per fold using best params
+    oos_scores = []
+    is_scores = []
+    for train_trades, val_trades in folds:
+        res_is = backtest_fn(train_trades, best_params)
+        res_oos = backtest_fn(val_trades, best_params)
+
+        key = "win_rate" if target_metric == "Win Rate" else (
+            "total_r" if target_metric == "Total R" else "expectancy_r"
+        )
+        is_scores.append(res_is.get(key, 0.0))
+        oos_scores.append(res_oos.get(key, 0.0))
+
+    avg_is = float(np.mean(is_scores)) if is_scores else 1.0
+    avg_oos = float(np.mean(oos_scores)) if oos_scores else 0.0
+    overfit_ratio = avg_is / (avg_oos + 1e-6)
+    overfit_warning = overfit_ratio > 2.0 or avg_oos < 0
 
     return {
-        "best_params": best.params,
-        "oos_median_score": best.value,
-        "oos_fold_scores": fold_scores,
-        "overfit_warning": overfit_ratio is not None and overfit_ratio > 0.5,
+        "best_params": best_params,
+        "oos_median_score": float(best_value),
+        "overfit_warning": overfit_warning,
         "overfit_ratio": overfit_ratio,
-        "study": study,
+        "oos_fold_scores": oos_scores,
     }
