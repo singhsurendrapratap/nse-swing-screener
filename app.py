@@ -24,11 +24,12 @@ from engine import (
     run_walk_forward_backtest,
     run_auto_optimize,
     select_active_universe,
+    get_market_breadth,
     screen_today,
     evaluate_positions,
 )
 
-APP_VERSION = "app-2026-08-31-e-dualbucket"
+APP_VERSION = "app-2026-09-03-f-robustness"
 
 POSITIONS_FILE = "positions.csv"
 POSITIONS_COLS = ["Symbol", "Entry Date", "Entry Price", "Qty", "Stop", "Target"]
@@ -125,7 +126,15 @@ with st.sidebar:
         help="The AI Agent tab can set this for you automatically."
     )
     friction_pct = st.slider(
-        "Friction: brokerage + STT + slippage (%)", 0.0, 0.5, 0.15, 0.05
+        "Base friction: brokerage + STT + slippage (%)", 0.0, 0.5, 0.15, 0.05
+    ) / 100
+    gap_slippage_frac = st.slider(
+        "Extra slippage on gap-up entries (% of the gap size)", 0, 50,
+        int(DEFAULT_PARAMS.get("gap_slippage_frac", 0.15) * 100), 5,
+        help="Breakout days often gap up more than a typical day, so a flat friction "
+             "rate understates real cost on the entry candle specifically. This adds "
+             "extra slippage proportional to how big that day's actual gap was -- a "
+             "2% gap with this at 15% adds another 0.3% cost on top of base friction.",
     ) / 100
 
     if partial_r <= breakeven_r:
@@ -158,6 +167,7 @@ params.update(
     runner_trail_mult=runner_trail_mult,
     hold_days=hold_days,
     friction_pct=friction_pct,
+    gap_slippage_frac=gap_slippage_frac,
 )
 
 # -----------------------------------------------------------------------------
@@ -308,6 +318,24 @@ with tab1:
         "clean completed daily candle. If you trade intraday, treat the result as a "
         "research signal, not a confirmed end-of-day breakout."
     )
+
+    with st.expander("📊 Check market breadth first (optional context)"):
+        st.caption(
+            "Informational only, not a hard gate -- and the 60%/30% labels below are "
+            "illustrative, not walk-forward validated. A market can be 'Nifty above its "
+            "50-SMA' while breadth underneath is narrow (a few large stocks propping up "
+            "the index) -- this catches that."
+        )
+        if st.button("Check breadth now"):
+            with st.spinner("Checking how many stocks in the universe are trending..."):
+                breadth = get_market_breadth(universe)
+            if breadth:
+                c1, c2 = st.columns(2)
+                c1.metric("% of universe above 50-day SMA", f"{breadth['breadth_pct']:.0f}%")
+                c2.metric("Stocks counted", f"{breadth['n_above']}/{breadth['n_stocks']}")
+                st.write(f"**{breadth['regime_label']}**")
+            else:
+                st.warning("Couldn't compute breadth right now -- try again in a moment.")
 
     use_smart_universe = st.checkbox(
         "🔄 Smart universe narrowing (auto-pick the most liquid, trending names from the pool)",
