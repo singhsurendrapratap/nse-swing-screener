@@ -29,7 +29,7 @@ from engine import (
     evaluate_positions,
 )
 
-APP_VERSION = "app-2026-09-03-g-breadthgate"
+APP_VERSION = "app-2026-09-03-h-breadthfix"
 
 POSITIONS_FILE = "positions.csv"
 POSITIONS_COLS = ["Symbol", "Entry Date", "Entry Price", "Qty", "Stop", "Target"]
