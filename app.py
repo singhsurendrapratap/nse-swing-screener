@@ -29,7 +29,7 @@ from engine import (
     evaluate_positions,
 )
 
-APP_VERSION = "app-2026-09-03-f-robustness"
+APP_VERSION = "app-2026-09-03-g-breadthgate"
 
 POSITIONS_FILE = "positions.csv"
 POSITIONS_COLS = ["Symbol", "Entry Date", "Entry Price", "Qty", "Stop", "Target"]
@@ -137,6 +137,18 @@ with st.sidebar:
              "2% gap with this at 15% adds another 0.3% cost on top of base friction.",
     ) / 100
 
+    use_breadth_gate = st.checkbox(
+        "🧪 Require minimum market breadth to trade (untested -- try via Agent/Backtest tabs)",
+        value=False,
+        help="Skips new entries on days where too few stocks in the universe are above "
+             "their own 50-day SMA, even if Nifty itself still looks fine -- catches a "
+             "market propped up by a handful of large stocks. This is a NEW, unvalidated "
+             "lever: test it via walk-forward before trusting it, same as everything else.",
+    )
+    min_breadth_pct = None
+    if use_breadth_gate:
+        min_breadth_pct = st.slider("Minimum breadth required to trade (%)", 10, 70, 40, 5)
+
     if partial_r <= breakeven_r:
         st.error("Partial target should be above the breakeven trigger.")
 
@@ -168,6 +180,7 @@ params.update(
     hold_days=hold_days,
     friction_pct=friction_pct,
     gap_slippage_frac=gap_slippage_frac,
+    min_breadth_pct=min_breadth_pct,
 )
 
 # -----------------------------------------------------------------------------
