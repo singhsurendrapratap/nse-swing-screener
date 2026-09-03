@@ -29,7 +29,7 @@ from engine import (
     evaluate_positions,
 )
 
-APP_VERSION = "app-2026-09-03-h-breadthfix"
+APP_VERSION = "app-2026-09-03-i-speedup"
 
 POSITIONS_FILE = "positions.csv"
 POSITIONS_COLS = ["Symbol", "Entry Date", "Entry Price", "Qty", "Stop", "Target"]
@@ -241,6 +241,12 @@ with tab0:
         help="Everything before this date is used to pick the best configuration. "
              "Everything from this date onward is the real, unbiased test of it.",
     )
+    agent_quick = st.checkbox(
+        "⚡ Quick search (27 combinations instead of 54 -- faster, less thorough)",
+        value=False,
+        help="Use this if the full search times out or feels too slow on your connection. "
+             "Trades search breadth for speed; treat quick-mode results as a rougher signal.",
+    )
 
     if st.button("🤖 Run AI Agent — Find My Best Settings", type="primary"):
         progress_bar = st.progress(0.0)
@@ -254,17 +260,28 @@ with tab0:
                 f"stop {atr_stop_try}x ATR..."
             )
 
-        with st.spinner("Downloading data once, then testing configurations..."):
-            agent_result = run_auto_optimize(
-                agent_universe, backtest_years, params,
-                split_date=agent_split_date.isoformat(),
-                mode=agent_mode,
-                progress_callback=_update_progress,
+        try:
+            with st.spinner("Downloading data once, then testing configurations..."):
+                agent_result = run_auto_optimize(
+                    agent_universe, backtest_years, params,
+                    split_date=agent_split_date.isoformat(),
+                    mode=agent_mode,
+                    quick=agent_quick,
+                    progress_callback=_update_progress,
+                )
+            progress_bar.empty()
+            status_text.empty()
+            agent_result["mode"] = agent_mode
+            st.session_state["agent_result"] = agent_result
+        except Exception as e:
+            progress_bar.empty()
+            status_text.empty()
+            st.error(
+                f"The search hit an error and couldn't finish: `{type(e).__name__}: {e}`\n\n"
+                "This is a real failure, not a silent timeout -- if this keeps happening, "
+                "try Quick search, a shorter backtest window, or a smaller universe."
             )
-        progress_bar.empty()
-        status_text.empty()
-        agent_result["mode"] = agent_mode
-        st.session_state["agent_result"] = agent_result
+            st.session_state.pop("agent_result", None)
 
     if "agent_result" in st.session_state:
         agent_result = st.session_state["agent_result"]
