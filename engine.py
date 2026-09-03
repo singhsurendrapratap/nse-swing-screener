@@ -22,7 +22,7 @@ this session, ENGINE_VERSION below exists specifically so you can confirm a
 redeploy actually took -- check the sidebar footer against this string.
 """
 
-ENGINE_VERSION = "engine-2026-08-31-d-agent"
+ENGINE_VERSION = "engine-2026-08-31-e-dualbucket"
 
 import pandas as pd
 import numpy as np
@@ -31,7 +31,8 @@ from datetime import datetime, timedelta
 
 BENCHMARK_TICKER = "^NSEI"
 
-DEFAULT_UNIVERSE = [
+STABLE_UNIVERSE = [
+    # Nifty 50 core
     "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS", "HINDUNILVR.NS",
     "ITC.NS", "SBIN.NS", "BHARTIARTL.NS", "KOTAKBANK.NS", "LT.NS", "AXISBANK.NS",
     "BAJFINANCE.NS", "ASIANPAINT.NS", "MARUTI.NS", "SUNPHARMA.NS", "TITAN.NS",
@@ -42,9 +43,17 @@ DEFAULT_UNIVERSE = [
     "DIVISLAB.NS", "HEROMOTOCO.NS", "HINDALCO.NS", "COALINDIA.NS", "BPCL.NS",
     "SBILIFE.NS", "HDFCLIFE.NS", "APOLLOHOSP.NS", "UPL.NS", "BAJAJ-AUTO.NS",
     "TATACONSUM.NS",
+    # Nifty Next 50 / other verified large-caps -- widens the "stable" bucket
+    # without guessing at names. Verified via NSE/index-factsheet sources.
+    "ADANIPOWER.NS", "HAL.NS", "TVSMOTOR.NS", "VBL.NS", "TATAPOWER.NS",
+    "CHOLAFIN.NS", "VEDL.NS", "ADANIGREEN.NS", "ADANIENSOL.NS", "PIDILITIND.NS",
+    "SIEMENS.NS", "ABB.NS", "HAVELLS.NS", "DABUR.NS", "COLPAL.NS",
+    "GODREJCP.NS", "BANKBARODA.NS", "CANBK.NS", "PNB.NS", "LTIM.NS",
+    "NAUKRI.NS", "ZYDUSLIFE.NS", "UNITDSPR.NS", "SHREECEM.NS", "AMBUJACEM.NS",
+    "DMART.NS", "ICICIPRULI.NS", "ICICIGI.NS", "SBICARD.NS", "HDFCAMC.NS",
 ]
 
-MIDSMALLCAP_UNIVERSE = [
+DYNAMIC_UNIVERSE = [
     "FEDERALBNK.NS", "MCX.NS", "SUZLON.NS", "BHEL.NS", "LAURUSLABS.NS", "POLYCAB.NS",
     "ABCAPITAL.NS", "INDIANB.NS", "PAGEIND.NS", "MPHASIS.NS", "PERSISTENT.NS",
     "COFORGE.NS", "LTTS.NS", "TATACOMM.NS", "VOLTAS.NS", "TRENT.NS", "GODREJPROP.NS",
@@ -56,6 +65,20 @@ MIDSMALLCAP_UNIVERSE = [
     "TORNTPHARM.NS", "GLENMARK.NS", "NATIONALUM.NS", "HINDZINC.NS", "JINDALSTEL.NS",
     "NMDC.NS", "SAIL.NS", "RECLTD.NS", "PFC.NS", "CONCOR.NS", "GMRINFRA.NS", "IRCTC.NS",
 ]
+
+# Backward-compatible aliases -- older code/screenshots referenced these names.
+DEFAULT_UNIVERSE = STABLE_UNIVERSE
+MIDSMALLCAP_UNIVERSE = DYNAMIC_UNIVERSE
+
+# CAVEAT, worth repeating: both lists are TODAY's known liquid, established
+# names, tested against PAST years. Stocks that got delisted or crashed out
+# of relevance in the meantime aren't included -- this is survivorship bias,
+# and it applies to any curated or index-based universe, not just this one.
+# We deliberately did NOT expand to a claimed "Nifty 500" list: hardcoding
+# 500 tickers from memory risks silently wrong/delisted symbols, and a single
+# yf.download() call across 500 tickers risks rate-limiting or timing out on
+# Streamlit Cloud's free tier. This ~80-stock-per-bucket expansion roughly
+# doubles the previous universe with names we can actually stand behind.
 
 DEFAULT_PARAMS = dict(
     # Risk / exit
@@ -548,6 +571,86 @@ def _extract_symbol_frame(data: pd.DataFrame, sym: str, universe_len: int) -> pd
     except Exception:
         return pd.DataFrame()
 
+# -----------------------------------------------------------------------------
+# LIVE-ONLY: liquidity + relative-strength ranking, for auto-narrowing a pool
+# -----------------------------------------------------------------------------
+#
+# IMPORTANT DESIGN NOTE, worth reading before touching this section:
+# This ranks TODAY's most liquid, strongest-momentum names out of a larger
+# candidate pool -- exactly the "let the AI pick the best names so I don't
+# have to look at all of them" idea. It is wired into the LIVE screener only
+# (screen_today), never into run_backtest / run_walk_forward_backtest /
+# run_auto_optimize. Reason: ranking by TODAY's turnover and momentum and
+# then using that ranked list to pick which stocks to backtest over the past
+# few years would silently reintroduce a lookahead/survivorship bias --
+# today's leaders were not necessarily leaders two years ago. Backtesting
+# stays on the full static pool; only the live "what should I look at today"
+# step gets the dynamic narrowing.
+
+def compute_liquidity_and_rs(pool: list, lookback_days: int = 90) -> pd.DataFrame:
+    """
+    For each ticker in `pool`, computes:
+      - avg_turnover_20d: 20-day average of Close x Volume (a liquidity proxy)
+      - rs_50d: 50-day stock return minus Nifty's 50-day return (momentum,
+        same "margin not ratio" logic as add_relative_strength -- robust to
+        negative return periods)
+    Returns a DataFrame with one row per ticker that had enough history.
+    """
+    start = (datetime.now() - timedelta(days=lookback_days + 30)).strftime("%Y-%m-%d")
+    nifty_df = get_nifty_data(start)
+    nifty_close = nifty_df["Close"] if not nifty_df.empty else pd.Series(dtype=float)
+    data = yf.download(pool, start=start, group_by="ticker", auto_adjust=True,
+                        progress=False, threads=True)
+
+    rows = []
+    for sym in pool:
+        try:
+            df = _extract_symbol_frame(data, sym, len(pool))
+            if len(df) < 55:
+                continue
+            turnover20 = (df["Close"] * df["Volume"]).rolling(20).mean().iloc[-1]
+            if len(df) >= 51:
+                stock_ret50 = df["Close"].iloc[-1] / df["Close"].iloc[-51] - 1
+            else:
+                stock_ret50 = np.nan
+            aligned = nifty_close.reindex(df.index, method="ffill")
+            if len(aligned) >= 51 and pd.notna(aligned.iloc[-51]):
+                nifty_ret50 = aligned.iloc[-1] / aligned.iloc[-51] - 1
+            else:
+                nifty_ret50 = np.nan
+            rs50 = (stock_ret50 - nifty_ret50) if pd.notna(stock_ret50) and pd.notna(nifty_ret50) else np.nan
+            rows.append({
+                "symbol": sym,
+                "avg_turnover_20d": turnover20,
+                "rs_50d": rs50,
+            })
+        except Exception:
+            continue
+    return pd.DataFrame(rows)
+
+
+def select_active_universe(pool: list, top_n: int, min_turnover_percentile: float = 0.0) -> tuple:
+    """
+    LIVE-ONLY. Ranks `pool` by 20-day liquidity and 50-day relative strength,
+    optionally drops the bottom `min_turnover_percentile` of names by
+    liquidity (illiquid/dormant), then returns the top `top_n` tickers by
+    relative strength -- today's "active universe" for screening.
+
+    Returns (active_tickers, ranked_df) so the caller can show the ranking
+    table for transparency, not just the final narrowed list.
+    """
+    ranked = compute_liquidity_and_rs(pool)
+    if ranked.empty:
+        return pool[:top_n], ranked  # fallback: fixed order if ranking failed entirely
+
+    if min_turnover_percentile > 0:
+        cutoff = ranked["avg_turnover_20d"].quantile(min_turnover_percentile)
+        ranked = ranked[ranked["avg_turnover_20d"] >= cutoff]
+
+    ranked = ranked.dropna(subset=["rs_50d"]).sort_values("rs_50d", ascending=False).reset_index(drop=True)
+    active = ranked["symbol"].head(top_n).tolist()
+    return active, ranked
+
 
 def _fetch_universe_data(universe, years) -> dict:
     """Network fetch only -- prices + Nifty regime data. Split out from trade
@@ -690,14 +793,27 @@ def run_walk_forward_backtest(universe, years, params, out_sample_frac: float = 
 # AUTO-OPTIMIZE AGENT
 # -----------------------------------------------------------------------------
 
-# Deliberately small and curated -- these two levers (how selective the score
-# threshold is, how long winners are allowed to run) were the ones that showed
-# real, mechanism-backed effects across a long night of manual testing.
-# Searching a much wider grid would risk finding noise dressed up as edge --
-# exactly the overfitting problem walk-forward validation exists to catch.
+# Deliberately small and curated -- these are the levers that showed real,
+# mechanism-backed effects across a long night of manual testing. Adding a
+# 3rd dimension (stop distance) roughly doubles the grid; that's the bound
+# we're comfortable with. Going to 5-6 dimensions (thousands of combinations)
+# turns "search" into "guaranteed to find noise that looks like edge" -- see
+# the profit-factor swing from a SINGLE parameter change this session
+# (0.90 -> 0.98 -> 0.96 just from hold_days) for why that risk is real, not
+# theoretical.
 AUTO_OPTIMIZE_GRID = {
     "score_threshold": [72, 76, 80, 83, 86, 90],
     "hold_days": [20, 30, 40],
+    "atr_stop_mult": [1.5, 2.0, 2.5],
+}
+
+# Mode presets: different starting risk posture per bucket, matching the
+# "stable = tighter/higher win-rate, dynamic = wider/bigger winners" idea.
+# These only set the STARTING params the grid search is applied on top of --
+# the grid still searches score/hold/stop for whichever mode is selected.
+MODE_PRESETS = {
+    "stable": dict(breakeven_r=0.75, partial_r=1.75, runner_trail_mult=1.5),
+    "dynamic": dict(breakeven_r=1.25, partial_r=3.0, runner_trail_mult=2.5),
 }
 
 
@@ -705,12 +821,18 @@ def run_auto_optimize(
     universe, years, base_params, split_date,
     min_in_sample_trades: int = 15,
     min_out_sample_trades: int = 8,
+    mode: str = None,
     progress_callback=None,
 ) -> dict:
     """
     Rule-based search agent -- no external AI service, fully deterministic and
     inspectable. Fetches price data ONCE, then evaluates a small curated grid
-    of (score_threshold, hold_days) combinations against it.
+    of (score_threshold, hold_days, atr_stop_mult) combinations against it.
+
+    mode: "stable" or "dynamic", optional. If given, overlays MODE_PRESETS
+    onto base_params before searching (different default risk posture per
+    bucket), matching the dual-bucket idea: stable favors tighter, more
+    consistent exits; dynamic favors wider stops and bigger runners.
 
     The critical discipline this enforces, which manual tuning this session
     did NOT follow: the winning configuration is selected using ONLY
@@ -718,28 +840,34 @@ def run_auto_optimize(
     winner is then reported as-is -- data the selection process never saw,
     so it's an honest read of whether the choice generalizes.
 
-    progress_callback(done, total, score_threshold, hold_days), if given, is
-    called after each combination so a caller (e.g. a Streamlit progress bar)
-    can show live progress during what can be a slow search.
+    progress_callback(done, total, score_threshold, hold_days, atr_stop_mult),
+    if given, is called after each combination so a caller (e.g. a Streamlit
+    progress bar) can show live progress during what can be a slow search.
 
     Returns {"leaderboard": [...], "best": {...} | None, "recommendation_text": str}
     """
+    effective_base = dict(base_params)
+    if mode in MODE_PRESETS:
+        effective_base.update(MODE_PRESETS[mode])
+
     fetched = _fetch_universe_data(universe, years)
     combos = [
-        (st_, hd)
+        (st_, hd, sm)
         for st_ in AUTO_OPTIMIZE_GRID["score_threshold"]
         for hd in AUTO_OPTIMIZE_GRID["hold_days"]
+        for sm in AUTO_OPTIMIZE_GRID["atr_stop_mult"]
     ]
 
     results = []
-    for idx, (score_threshold, hold_days) in enumerate(combos):
-        params = dict(base_params)
+    for idx, (score_threshold, hold_days, atr_stop_mult) in enumerate(combos):
+        params = dict(effective_base)
         params["score_threshold"] = score_threshold
         params["hold_days"] = hold_days
+        params["atr_stop_mult"] = atr_stop_mult
 
         trades_df = _generate_trades_from_fetched(universe, fetched, params)
         if progress_callback:
-            progress_callback(idx + 1, len(combos), score_threshold, hold_days)
+            progress_callback(idx + 1, len(combos), score_threshold, hold_days, atr_stop_mult)
         if trades_df.empty:
             continue
 
@@ -756,6 +884,7 @@ def run_auto_optimize(
         results.append({
             "score_threshold": score_threshold,
             "hold_days": hold_days,
+            "atr_stop_mult": atr_stop_mult,
             "in_sample_trades": ins.get("total_trades", 0),
             "in_sample_win_rate": ins.get("win_rate", 0.0),
             "in_sample_expectancy": ins.get("expectancy_r", 0.0),
@@ -814,7 +943,7 @@ def run_auto_optimize(
 
     recommendation_text = (
         f"Best configuration found: quality score \u2265 {best['score_threshold']}, "
-        f"maximum hold {best['hold_days']} trading days.\n\n"
+        f"maximum hold {best['hold_days']} trading days, stop-loss {best['atr_stop_mult']}x ATR.\n\n"
         f"Chosen using only data before {split_date} "
         f"({best['in_sample_trades']} trades, {best['in_sample_win_rate']:.0f}% win rate, "
         f"{ins_exp:+.2f}R expectancy).\n\n"
