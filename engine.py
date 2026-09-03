@@ -22,7 +22,7 @@ this session, ENGINE_VERSION below exists specifically so you can confirm a
 redeploy actually took -- check the sidebar footer against this string.
 """
 
-ENGINE_VERSION = "engine-2026-09-03-i-speedup"
+ENGINE_VERSION = "engine-2026-09-03-j-breadthaccuracy"
 
 import pandas as pd
 import numpy as np
@@ -240,10 +240,16 @@ def compute_historical_breadth(universe: list, fetched_data) -> pd.Series:
     for sym in universe:
         try:
             df = _extract_symbol_frame(fetched_data, sym, len(universe))
-            if len(df) < 55:
-                continue
+            if len(df) < 210:  # same bar as everywhere else -- don't let thin/gappy
+                continue        # stocks that couldn't even be traded dilute the reading
             sma50 = df["Close"].rolling(50).mean()
-            per_stock_above[sym] = (df["Close"] > sma50)
+            # FIX: (Close > NaN) silently evaluates to False in pandas, not "unknown" --
+            # that was quietly counting warmup periods and data gaps as "below its
+            # average" instead of excluding them. .where(sma50.notna()) keeps the real
+            # comparison where sma50 exists and sets NaN everywhere else, so skipna=True
+            # below actually skips them instead of treating them as bearish.
+            above = (df["Close"] > sma50).where(sma50.notna())
+            per_stock_above[sym] = above
         except Exception:
             continue
 
@@ -711,6 +717,35 @@ def select_active_universe(pool: list, top_n: int, min_turnover_percentile: floa
     ranked = ranked.dropna(subset=["rs_50d"]).sort_values("rs_50d", ascending=False).reset_index(drop=True)
     active = ranked["symbol"].head(top_n).tolist()
     return active, ranked
+
+
+def diagnose_breadth(universe: list, years: float = 3) -> dict:
+    """
+    Diagnostic tool -- computes the actual historical breadth series and
+    returns real statistics about it, so a genuinely-strict reading can be
+    told apart from a lookup/coverage bug without guessing. Call this from
+    the UI and look at the numbers directly rather than inferring from
+    downstream symptoms (like the agent finding zero valid configurations).
+    """
+    fetched = _fetch_universe_data(universe, years)
+    breadth = fetched.get("breadth", pd.Series(dtype=float))
+    if breadth.empty:
+        return {"error": "Breadth series is completely empty -- computation itself failed, not just strict."}
+
+    valid = breadth.dropna()
+    return {
+        "n_dates_total": len(breadth),
+        "n_dates_valid": len(valid),
+        "n_dates_nan": len(breadth) - len(valid),
+        "min_pct": float(valid.min()) if len(valid) else None,
+        "max_pct": float(valid.max()) if len(valid) else None,
+        "mean_pct": float(valid.mean()) if len(valid) else None,
+        "median_pct": float(valid.median()) if len(valid) else None,
+        "pct_days_below_40": float((valid < 40).mean() * 100) if len(valid) else None,
+        "pct_days_below_30": float((valid < 30).mean() * 100) if len(valid) else None,
+        "last_10_values": valid.tail(10).round(1).to_dict(),
+        "n_stocks_in_universe": len(universe),
+    }
 
 
 def get_market_breadth(universe: list) -> dict:
