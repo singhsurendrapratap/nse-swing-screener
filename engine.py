@@ -22,7 +22,7 @@ this session, ENGINE_VERSION below exists specifically so you can confirm a
 redeploy actually took -- check the sidebar footer against this string.
 """
 
-ENGINE_VERSION = "engine-2026-08-31-e-dualbucket"
+ENGINE_VERSION = "engine-2026-09-03-f-robustness"
 
 import pandas as pd
 import numpy as np
@@ -88,6 +88,8 @@ DEFAULT_PARAMS = dict(
     runner_trail_mult=2.0,
     hold_days=20,
     friction_pct=0.0015,
+    gap_slippage_frac=0.15,  # extra slippage = 15% of the entry candle's gap-up size,
+                              # on top of flat friction -- breakout days gap more than average
 
     # New selection engine
     score_threshold=78,
@@ -513,7 +515,9 @@ def backtest_symbol(df: pd.DataFrame, market_regime: pd.Series, params: dict) ->
 
         if result["mandatory_ok"] and result["score"] >= params.get("score_threshold", 78):
             entry_day = df.iloc[i + 1]
-            entry_price = entry_day["Open"] * (1 + params["friction_pct"])
+            gap_pct = max(0.0, (entry_day["Open"] / row["Close"] - 1) * 100) if row["Close"] else 0.0
+            effective_friction = params["friction_pct"] + gap_pct / 100 * params.get("gap_slippage_frac", 0.0)
+            entry_price = entry_day["Open"] * (1 + effective_friction)
             atr_entry = row["ATR14"]
             if pd.isna(atr_entry) or atr_entry <= 0:
                 i += 1
@@ -650,6 +654,51 @@ def select_active_universe(pool: list, top_n: int, min_turnover_percentile: floa
     ranked = ranked.dropna(subset=["rs_50d"]).sort_values("rs_50d", ascending=False).reset_index(drop=True)
     active = ranked["symbol"].head(top_n).tolist()
     return active, ranked
+
+
+def get_market_breadth(universe: list) -> dict:
+    """
+    LIVE-ONLY, informational (not a hard gate, and its 60%/30% labels are
+    illustrative, NOT walk-forward validated -- treat as context, the same
+    way a human trader glances at "how many stocks are trending" before
+    deciding how aggressive to be today).
+
+    % of `universe` currently trading above their own 50-day SMA -- a simple,
+    well-established regime-strength gauge (breadth), independent of Nifty's
+    own single-index trend. A market can be "Nifty above its 50-SMA" while
+    breadth underneath is narrow (a handful of large stocks propping up the
+    index) -- breadth catches that, a single-index check can't.
+    """
+    start = (datetime.now() - timedelta(days=200)).strftime("%Y-%m-%d")
+    data = yf.download(universe, start=start, group_by="ticker", auto_adjust=True,
+                        progress=False, threads=True)
+    above, total = 0, 0
+    for sym in universe:
+        try:
+            df = _extract_symbol_frame(data, sym, len(universe))
+            if len(df) < 55:
+                continue
+            sma50 = df["Close"].rolling(50).mean().iloc[-1]
+            if pd.isna(sma50):
+                continue
+            total += 1
+            if df["Close"].iloc[-1] > sma50:
+                above += 1
+        except Exception:
+            continue
+
+    if total == 0:
+        return {}
+
+    breadth_pct = above / total * 100
+    if breadth_pct >= 60:
+        regime_label = "Aggressive -- breadth > 60%, most of the universe is trending up"
+    elif breadth_pct >= 30:
+        regime_label = "Selective -- breadth 30-60%, a mixed market, be choosier"
+    else:
+        regime_label = "Defensive -- breadth < 30%, most of the universe is NOT trending up"
+
+    return {"breadth_pct": breadth_pct, "n_stocks": total, "n_above": above, "regime_label": regime_label}
 
 
 def _fetch_universe_data(universe, years) -> dict:
@@ -906,9 +955,44 @@ def run_auto_optimize(
             ),
         }
 
-    # SELECTION uses ONLY in-sample expectancy. Out-of-sample is never
-    # consulted here -- that's the whole point.
-    leaderboard = sorted(results, key=lambda r: r["in_sample_expectancy"], reverse=True)
+    # SELECTION uses ONLY in-sample data. Out-of-sample is never consulted
+    # here -- selecting by out-of-sample performance would contaminate the
+    # one honest test we have (proven by this session's own leaderboard: the
+    # config that "won" on out-of-sample alone was a mediocre in-sample
+    # performer -- picking it would just relocate the overfitting problem,
+    # not fix it).
+    #
+    # STABILITY ADJUSTMENT: rather than picking the single best in-sample
+    # point (which can be a lucky spike -- a narrow combination that looked
+    # great by chance), each candidate's score also rewards its immediate
+    # grid neighbors also looking decent. A real, broad effect shows up
+    # across nearby parameter values; a curve-fit spike doesn't.
+    by_key = {(r["score_threshold"], r["hold_days"], r["atr_stop_mult"]): r for r in results}
+
+    def _stability_adjusted_score(r):
+        neighbors = []
+        for d_score in AUTO_OPTIMIZE_GRID["score_threshold"]:
+            for d_hold in AUTO_OPTIMIZE_GRID["hold_days"]:
+                for d_stop in AUTO_OPTIMIZE_GRID["atr_stop_mult"]:
+                    key = (d_score, d_hold, d_stop)
+                    if key == (r["score_threshold"], r["hold_days"], r["atr_stop_mult"]):
+                        continue
+                    # "adjacent" = differs in exactly one dimension by one grid step
+                    diffs = sum([
+                        d_score != r["score_threshold"],
+                        d_hold != r["hold_days"],
+                        d_stop != r["atr_stop_mult"],
+                    ])
+                    if diffs == 1 and key in by_key:
+                        neighbors.append(by_key[key]["in_sample_expectancy"])
+        neighbor_avg = sum(neighbors) / len(neighbors) if neighbors else r["in_sample_expectancy"]
+        # Blend: mostly the candidate's own result, partly how its neighbors did.
+        return 0.7 * r["in_sample_expectancy"] + 0.3 * neighbor_avg
+
+    for r in results:
+        r["stability_adjusted_score"] = _stability_adjusted_score(r)
+
+    leaderboard = sorted(results, key=lambda r: r["stability_adjusted_score"], reverse=True)
     best = leaderboard[0]
 
     oos_n = best["out_sample_trades"]
@@ -944,9 +1028,10 @@ def run_auto_optimize(
     recommendation_text = (
         f"Best configuration found: quality score \u2265 {best['score_threshold']}, "
         f"maximum hold {best['hold_days']} trading days, stop-loss {best['atr_stop_mult']}x ATR.\n\n"
-        f"Chosen using only data before {split_date} "
-        f"({best['in_sample_trades']} trades, {best['in_sample_win_rate']:.0f}% win rate, "
-        f"{ins_exp:+.2f}R expectancy).\n\n"
+        f"Chosen using only data before {split_date}, favoring configurations whose nearby "
+        f"parameter values also looked decent (not just a single lucky spike): "
+        f"{best['in_sample_trades']} trades, {best['in_sample_win_rate']:.0f}% win rate, "
+        f"{ins_exp:+.2f}R expectancy.\n\n"
         f"{verdict}"
     )
 
