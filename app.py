@@ -25,11 +25,12 @@ from engine import (
     run_auto_optimize,
     select_active_universe,
     get_market_breadth,
+    diagnose_breadth,
     screen_today,
     evaluate_positions,
 )
 
-APP_VERSION = "app-2026-09-03-i-speedup"
+APP_VERSION = "app-2026-09-03-j-breadthaccuracy"
 
 POSITIONS_FILE = "positions.csv"
 POSITIONS_COLS = ["Symbol", "Entry Date", "Entry Price", "Qty", "Stop", "Target"]
@@ -148,6 +149,41 @@ with st.sidebar:
     min_breadth_pct = None
     if use_breadth_gate:
         min_breadth_pct = st.slider("Minimum breadth required to trade (%)", 10, 70, 40, 5)
+        with st.expander("🔍 Diagnose actual breadth values (do this before trusting the gate)"):
+            st.caption(
+                "Shows the REAL computed breadth numbers instead of inferring from downstream "
+                "results -- tells a genuine strict reading apart from a computation bug."
+            )
+            if st.button("Run breadth diagnostic"):
+                with st.spinner("Computing historical breadth series..."):
+                    diag = diagnose_breadth(universe, backtest_years)
+                if "error" in diag:
+                    st.error(diag["error"])
+                else:
+                    d1, d2, d3 = st.columns(3)
+                    d1.metric("Min breadth", f"{diag['min_pct']:.0f}%" if diag['min_pct'] is not None else "N/A")
+                    d2.metric("Mean breadth", f"{diag['mean_pct']:.0f}%" if diag['mean_pct'] is not None else "N/A")
+                    d3.metric("Max breadth", f"{diag['max_pct']:.0f}%" if diag['max_pct'] is not None else "N/A")
+                    st.write(
+                        f"**{diag['n_dates_valid']}** valid dates, **{diag['n_dates_nan']}** with no data "
+                        f"(out of {diag['n_dates_total']} total) across **{diag['n_stocks_in_universe']}** stocks."
+                    )
+                    st.write(
+                        f"**{diag['pct_days_below_40']:.0f}%** of days had breadth below 40 | "
+                        f"**{diag['pct_days_below_30']:.0f}%** of days below 30"
+                        if diag['pct_days_below_40'] is not None else "No valid data to summarize."
+                    )
+                    st.write("Last 10 breadth readings:", diag["last_10_values"])
+                    if diag['n_dates_valid'] == 0:
+                        st.error("Zero valid dates -- this IS a real bug, not just a strict reading.")
+                    elif diag['max_pct'] is not None and diag['max_pct'] < 40:
+                        st.warning(
+                            f"Breadth never exceeded {diag['max_pct']:.0f}% in this window -- a 40% "
+                            "threshold would correctly block every single trade. Not a bug: this "
+                            "universe's breadth genuinely never got that high. Try a lower threshold."
+                        )
+                    else:
+                        st.success("Breadth data looks real and varied -- the gate should be working correctly.")
 
     if partial_r <= breakeven_r:
         st.error("Partial target should be above the breakeven trigger.")
