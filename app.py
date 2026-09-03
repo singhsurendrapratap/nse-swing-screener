@@ -30,7 +30,7 @@ from engine import (
     evaluate_positions,
 )
 
-APP_VERSION = "app-2026-09-03-j-breadthaccuracy"
+APP_VERSION = "app-2026-09-03-k-orderfix"
 
 POSITIONS_FILE = "positions.csv"
 POSITIONS_COLS = ["Symbol", "Entry Date", "Entry Price", "Qty", "Stop", "Target"]
@@ -149,6 +149,25 @@ with st.sidebar:
     min_breadth_pct = None
     if use_breadth_gate:
         min_breadth_pct = st.slider("Minimum breadth required to trade (%)", 10, 70, 40, 5)
+
+    if partial_r <= breakeven_r:
+        st.error("Partial target should be above the breakeven trigger.")
+
+    st.divider()
+    universe_choice = st.radio(
+        "Universe",
+        ["Large-cap (Nifty 50-ish)", "Mid/Small-cap (higher momentum, higher risk)"],
+        index=0,
+    )
+    if universe_choice.startswith("Mid"):
+        st.warning("Mid/small-cap universe has survivorship bias because today's survivors are used historically.")
+        default_universe = MIDSMALLCAP_UNIVERSE
+    else:
+        default_universe = DEFAULT_UNIVERSE
+    universe = st.multiselect("Tickers", default_universe, default=default_universe)
+    backtest_years = st.slider("Backtest lookback (years)", 1, 5, 3)
+
+    if use_breadth_gate:
         with st.expander("🔍 Diagnose actual breadth values (do this before trusting the gate)"):
             st.caption(
                 "Shows the REAL computed breadth numbers instead of inferring from downstream "
@@ -184,23 +203,6 @@ with st.sidebar:
                         )
                     else:
                         st.success("Breadth data looks real and varied -- the gate should be working correctly.")
-
-    if partial_r <= breakeven_r:
-        st.error("Partial target should be above the breakeven trigger.")
-
-    st.divider()
-    universe_choice = st.radio(
-        "Universe",
-        ["Large-cap (Nifty 50-ish)", "Mid/Small-cap (higher momentum, higher risk)"],
-        index=0,
-    )
-    if universe_choice.startswith("Mid"):
-        st.warning("Mid/small-cap universe has survivorship bias because today's survivors are used historically.")
-        default_universe = MIDSMALLCAP_UNIVERSE
-    else:
-        default_universe = DEFAULT_UNIVERSE
-    universe = st.multiselect("Tickers", default_universe, default=default_universe)
-    backtest_years = st.slider("Backtest lookback (years)", 1, 5, 3)
 
 params = dict(DEFAULT_PARAMS)
 params.update(
