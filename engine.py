@@ -22,7 +22,7 @@ this session, ENGINE_VERSION below exists specifically so you can confirm a
 redeploy actually took -- check the sidebar footer against this string.
 """
 
-ENGINE_VERSION = "engine-2026-09-03-f-robustness"
+ENGINE_VERSION = "engine-2026-09-03-g-breadthgate"
 
 import pandas as pd
 import numpy as np
@@ -90,6 +90,11 @@ DEFAULT_PARAMS = dict(
     friction_pct=0.0015,
     gap_slippage_frac=0.15,  # extra slippage = 15% of the entry candle's gap-up size,
                               # on top of flat friction -- breakout days gap more than average
+    min_breadth_pct=None,  # None = off. If set (e.g. 40), skips entries on days where
+                            # fewer than this % of the universe is above its own 50-SMA,
+                            # even if Nifty's own trend still looks fine. OFF by default --
+                            # untested until proven via the walk-forward/Agent tabs, same
+                            # discipline as everything else added tonight.
 
     # New selection engine
     score_threshold=78,
@@ -216,6 +221,38 @@ def get_market_regime(nifty_df: pd.DataFrame) -> pd.Series:
         & (nifty_df["EMA20"] > nifty_df["SMA50"])
     )
     return cond.rename("bullish")
+
+
+def compute_historical_breadth(universe: list, fetched_data) -> pd.Series:
+    """
+    UNLIKE get_market_breadth (a live snapshot), this is a real time series --
+    for every date in the data, what % of `universe` closed above its OWN
+    50-day SMA on THAT date, using only that date's trailing window. No
+    future information involved, so -- unlike the liquidity/RS active-universe
+    selection -- this one IS safe to use inside the backtest.
+
+    Returns a Series indexed by date, values 0-100. Used as an additional,
+    optional market-condition gate: skip new entries on days where breadth is
+    weak, even if Nifty's own single-index trend still looks fine (a market
+    can be "Nifty up" while only a handful of stocks are actually working).
+    """
+    per_stock_above = {}
+    for sym in universe:
+        try:
+            df = _extract_symbol_frame(fetched_data, sym, len(universe))
+            if len(df) < 55:
+                continue
+            sma50 = df["Close"].rolling(50).mean()
+            per_stock_above[sym] = (df["Close"] > sma50)
+        except Exception:
+            continue
+
+    if not per_stock_above:
+        return pd.Series(dtype=float)
+
+    aligned = pd.DataFrame(per_stock_above)
+    breadth_pct = aligned.mean(axis=1, skipna=True) * 100
+    return breadth_pct.rename("breadth_pct")
 
 
 def add_relative_strength(df: pd.DataFrame, nifty_close: pd.Series, lookback: int) -> pd.DataFrame:
@@ -500,17 +537,25 @@ def simulate_layered_exit(df: pd.DataFrame, i: int, entry_price: float, atr_entr
 # BACKTEST
 # -----------------------------------------------------------------------------
 
-def backtest_symbol(df: pd.DataFrame, market_regime: pd.Series, params: dict) -> list:
+def backtest_symbol(df: pd.DataFrame, market_regime: pd.Series, params: dict, breadth: pd.Series = None) -> list:
     trades = []
     df = df.reset_index()
     if "Date" not in df.columns:
         df.rename(columns={df.columns[0]: "Date"}, inplace=True)
+    breadth = breadth if breadth is not None else pd.Series(dtype=float)
 
     i = 0
     while i < len(df) - 2:
         row = df.iloc[i]
         date = row["Date"]
         mkt_ok = bool(market_regime.get(date, False))
+
+        min_breadth = params.get("min_breadth_pct")
+        if min_breadth and not breadth.empty:
+            today_breadth = breadth.get(date, None)
+            if today_breadth is None or today_breadth < min_breadth:
+                mkt_ok = False  # market too narrow today, even if Nifty itself looks fine
+
         result = score_setup(row, mkt_ok, params, include_earnings=False)
 
         if result["mandatory_ok"] and result["score"] >= params.get("score_threshold", 78):
@@ -714,7 +759,8 @@ def _fetch_universe_data(universe, years) -> dict:
         universe, start=start, group_by="ticker", auto_adjust=True,
         progress=False, threads=True
     )
-    return {"market_regime": market_regime, "nifty_close": nifty_close, "data": data}
+    breadth = compute_historical_breadth(universe, data)
+    return {"market_regime": market_regime, "nifty_close": nifty_close, "data": data, "breadth": breadth}
 
 
 def _generate_trades_from_fetched(universe, fetched: dict, params) -> pd.DataFrame:
@@ -724,6 +770,7 @@ def _generate_trades_from_fetched(universe, fetched: dict, params) -> pd.DataFra
     market_regime = fetched["market_regime"]
     nifty_close = fetched["nifty_close"]
     data = fetched["data"]
+    breadth = fetched.get("breadth", pd.Series(dtype=float))
 
     all_trades = []
     for sym in universe:
@@ -733,7 +780,7 @@ def _generate_trades_from_fetched(universe, fetched: dict, params) -> pd.DataFra
                 continue
             df = compute_indicators(df)
             df = add_relative_strength(df, nifty_close, params.get("rs_lookback", 63))
-            trades = backtest_symbol(df, market_regime, params)
+            trades = backtest_symbol(df, market_regime, params, breadth)
             for t in trades:
                 t["symbol"] = sym.replace(".NS", "")
             all_trades.extend(trades)
