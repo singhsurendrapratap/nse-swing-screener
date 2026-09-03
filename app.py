@@ -16,16 +16,19 @@ from datetime import date
 from engine import (
     DEFAULT_UNIVERSE,
     MIDSMALLCAP_UNIVERSE,
+    STABLE_UNIVERSE,
+    DYNAMIC_UNIVERSE,
     DEFAULT_PARAMS,
     ENGINE_VERSION,
     run_backtest,
     run_walk_forward_backtest,
     run_auto_optimize,
+    select_active_universe,
     screen_today,
     evaluate_positions,
 )
 
-APP_VERSION = "app-2026-08-31-d-agent"
+APP_VERSION = "app-2026-08-31-e-dualbucket"
 
 POSITIONS_FILE = "positions.csv"
 POSITIONS_COLS = ["Symbol", "Entry Date", "Entry Price", "Qty", "Stop", "Target"]
@@ -175,11 +178,11 @@ with tab0:
     with st.expander("What exactly does it do? (for the curious)"):
         st.markdown(
             "1. Downloads price data for your selected universe **once**.\n"
-            "2. Tests a curated set of **18 configurations** (how selective to be, "
-            "how long to let winners run) against that data — these two settings "
-            "showed the biggest real effects during a long night of manual testing, "
-            "so the search is deliberately narrow rather than an unlimited grid, "
-            "to avoid finding noise dressed up as edge.\n"
+            "2. Tests a curated set of **54 configurations** (how selective to be, "
+            "how long to let winners run, how wide the stop-loss is) against that "
+            "data — these three settings showed the biggest real effects during a "
+            "long night of manual testing, so the search is deliberately narrow "
+            "rather than an unlimited grid, to avoid finding noise dressed up as edge.\n"
             "3. For each configuration, splits results into an **earlier period** "
             "(used to pick the winner) and a **later period** (never looked at "
             "during selection).\n"
@@ -189,6 +192,26 @@ with tab0:
             "5. Explains the result and lets you apply it with one tap."
         )
 
+    st.markdown("**Choose a mode**")
+    agent_mode_label = st.radio(
+        "Mode",
+        ["🛡️ Defensive / Stable (large-cap, tighter exits, steadier)",
+         "⚡ Aggressive / Growth (mid/small-cap, wider exits, bigger swings)"],
+        index=0,
+        label_visibility="collapsed",
+    )
+    agent_mode = "stable" if agent_mode_label.startswith("🛡️") else "dynamic"
+    agent_universe = STABLE_UNIVERSE if agent_mode == "stable" else DYNAMIC_UNIVERSE
+    if agent_mode == "dynamic":
+        st.caption(
+            "⚡ Mid/small-cap universe: today's known liquid survivors tested against "
+            "past years, so treat results as more optimistic than a true point-in-time "
+            "backtest (survivorship bias). Wider stops and bigger profit targets by default."
+        )
+    else:
+        st.caption("🛡️ Large-cap universe. Tighter stops and profit targets by default, aiming for steadier results.")
+    st.caption(f"This mode searches within {len(agent_universe)} tickers, independent of the sidebar's universe choice.")
+
     agent_split_date = st.date_input(
         "Treat data from this date onward as the honest test",
         value=date(2025, 1, 1),
@@ -197,28 +220,28 @@ with tab0:
     )
 
     if st.button("🤖 Run AI Agent — Find My Best Settings", type="primary"):
-        if not universe:
-            st.error("Select at least one ticker in the sidebar first.")
-        else:
-            progress_bar = st.progress(0.0)
-            status_text = st.empty()
+        progress_bar = st.progress(0.0)
+        status_text = st.empty()
 
-            def _update_progress(done, total, score_threshold_try, hold_days_try):
-                progress_bar.progress(done / total)
-                status_text.caption(
-                    f"Testing configuration {done}/{total}: "
-                    f"quality score ≥ {score_threshold_try}, max hold {hold_days_try} days..."
-                )
+        def _update_progress(done, total, score_threshold_try, hold_days_try, atr_stop_try):
+            progress_bar.progress(done / total)
+            status_text.caption(
+                f"Testing configuration {done}/{total}: "
+                f"quality score ≥ {score_threshold_try}, max hold {hold_days_try} days, "
+                f"stop {atr_stop_try}x ATR..."
+            )
 
-            with st.spinner("Downloading data once, then testing configurations..."):
-                agent_result = run_auto_optimize(
-                    universe, backtest_years, params,
-                    split_date=agent_split_date.isoformat(),
-                    progress_callback=_update_progress,
-                )
-            progress_bar.empty()
-            status_text.empty()
-            st.session_state["agent_result"] = agent_result
+        with st.spinner("Downloading data once, then testing configurations..."):
+            agent_result = run_auto_optimize(
+                agent_universe, backtest_years, params,
+                split_date=agent_split_date.isoformat(),
+                mode=agent_mode,
+                progress_callback=_update_progress,
+            )
+        progress_bar.empty()
+        status_text.empty()
+        agent_result["mode"] = agent_mode
+        st.session_state["agent_result"] = agent_result
 
     if "agent_result" in st.session_state:
         agent_result = st.session_state["agent_result"]
@@ -286,14 +309,42 @@ with tab1:
         "research signal, not a confirmed end-of-day breakout."
     )
 
+    use_smart_universe = st.checkbox(
+        "🔄 Smart universe narrowing (auto-pick the most liquid, trending names from the pool)",
+        value=False,
+        help="Ranks the sidebar's full universe by 20-day liquidity and 50-day relative "
+             "strength vs Nifty, RIGHT NOW, and only screens the top N -- so a stock that's "
+             "gone quiet or illiquid naturally rotates out without you doing anything. "
+             "LIVE-ONLY: this uses today's data to pick today's active list, so it's not "
+             "used in the Research Backtest tab (using today's leaders to pick which stocks "
+             "get backtested over past years would quietly bias the backtest).",
+    )
+    smart_top_n = None
+    if use_smart_universe:
+        smart_top_n = st.slider(
+            "How many top-ranked stocks to actually screen", 10, min(80, len(universe)),
+            min(40, len(universe)),
+        )
+
     if st.button("🔄 Find today's A+ setups", type="primary"):
         if not universe:
             st.error("Select at least one ticker.")
         elif partial_r <= breakeven_r:
             st.error("Fix the exit settings first: partial target must be above breakeven.")
         else:
+            screening_universe = universe
+            if use_smart_universe:
+                with st.spinner("Ranking the pool by liquidity and momentum..."):
+                    active_list, ranked_df = select_active_universe(universe, smart_top_n)
+                if active_list:
+                    screening_universe = active_list
+                    with st.expander(f"Active universe selected today ({len(active_list)} of {len(universe)} tickers)"):
+                        st.dataframe(ranked_df.head(smart_top_n).round(3), use_container_width=True, hide_index=True)
+                else:
+                    st.warning("Ranking returned nothing usable -- falling back to the full universe.")
+
             with st.spinner("Fetching market data, ranking setups, and checking earnings..."):
-                watchlist, market_bullish = screen_today(universe, capital, risk_pct, params)
+                watchlist, market_bullish = screen_today(screening_universe, capital, risk_pct, params)
 
             if not market_bullish:
                 st.warning(
