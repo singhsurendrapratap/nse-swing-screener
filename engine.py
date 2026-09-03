@@ -22,7 +22,7 @@ this session, ENGINE_VERSION below exists specifically so you can confirm a
 redeploy actually took -- check the sidebar footer against this string.
 """
 
-ENGINE_VERSION = "engine-2026-09-03-g-breadthgate"
+ENGINE_VERSION = "engine-2026-09-03-h-breadthfix"
 
 import pandas as pd
 import numpy as np
@@ -250,7 +250,7 @@ def compute_historical_breadth(universe: list, fetched_data) -> pd.Series:
     if not per_stock_above:
         return pd.Series(dtype=float)
 
-    aligned = pd.DataFrame(per_stock_above)
+    aligned = pd.DataFrame(per_stock_above).sort_index()
     breadth_pct = aligned.mean(axis=1, skipna=True) * 100
     return breadth_pct.rename("breadth_pct")
 
@@ -552,9 +552,21 @@ def backtest_symbol(df: pd.DataFrame, market_regime: pd.Series, params: dict, br
 
         min_breadth = params.get("min_breadth_pct")
         if min_breadth and not breadth.empty:
-            today_breadth = breadth.get(date, None)
-            if today_breadth is None or today_breadth < min_breadth:
+            # asof = most recent breadth reading AT OR BEFORE this date. Robust to
+            # breadth's index (a union of many stocks' individual date sets) not
+            # having an exact match for every single date -- unlike an exact-match
+            # .get(), which would silently fail-closed (block every trade) on any
+            # tiny misalignment, exactly the kind of bug that can zero out an
+            # entire backtest without an obvious error anywhere.
+            try:
+                today_breadth = breadth.asof(date)
+            except Exception:
+                today_breadth = None
+            if pd.notna(today_breadth) and today_breadth < min_breadth:
                 mkt_ok = False  # market too narrow today, even if Nifty itself looks fine
+            # If today_breadth is NaN/unavailable, fail OPEN -- don't let a data gap
+            # silently block every trade. The gate should narrow results when it has
+            # real data, not erase the whole backtest when it doesn't.
 
         result = score_setup(row, mkt_ok, params, include_earnings=False)
 
