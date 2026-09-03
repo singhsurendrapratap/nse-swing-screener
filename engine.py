@@ -22,7 +22,7 @@ this session, ENGINE_VERSION below exists specifically so you can confirm a
 redeploy actually took -- check the sidebar footer against this string.
 """
 
-ENGINE_VERSION = "engine-2026-09-03-h-breadthfix"
+ENGINE_VERSION = "engine-2026-09-03-i-speedup"
 
 import pandas as pd
 import numpy as np
@@ -775,23 +775,41 @@ def _fetch_universe_data(universe, years) -> dict:
     return {"market_regime": market_regime, "nifty_close": nifty_close, "data": data, "breadth": breadth}
 
 
-def _generate_trades_from_fetched(universe, fetched: dict, params) -> pd.DataFrame:
-    """Pure computation, no network calls -- runs the backtest against
-    already-downloaded price data. This is what makes the auto-optimize
-    agent fast: fetch once, evaluate many parameter combinations."""
-    market_regime = fetched["market_regime"]
+def _prepare_symbol_frames(universe, fetched: dict, rs_lookback: int = 63) -> dict:
+    """
+    Computes indicators + relative strength ONCE per symbol. Neither depends
+    on score_threshold, hold_days, or atr_stop_mult -- the three things the
+    auto-optimize agent actually searches over -- so doing this once and
+    reusing it across all 54 grid combinations (instead of recomputing it 54
+    times) is the single biggest available speedup for the agent. Returns
+    {symbol: prepared_dataframe}, skipping symbols with too little history.
+    """
     nifty_close = fetched["nifty_close"]
     data = fetched["data"]
-    breadth = fetched.get("breadth", pd.Series(dtype=float))
-
-    all_trades = []
+    prepared = {}
     for sym in universe:
         try:
             df = _extract_symbol_frame(data, sym, len(universe))
             if len(df) < 210:
                 continue
             df = compute_indicators(df)
-            df = add_relative_strength(df, nifty_close, params.get("rs_lookback", 63))
+            df = add_relative_strength(df, nifty_close, rs_lookback)
+            prepared[sym] = df
+        except Exception:
+            continue
+    return prepared
+
+
+def _run_backtest_on_prepared(universe, prepared: dict, market_regime, breadth, params) -> pd.DataFrame:
+    """The cheap, params-DEPENDENT part -- runs backtest_symbol against
+    already-prepared (indicators computed) dataframes. Safe to call many
+    times with different params once _prepare_symbol_frames has run once."""
+    all_trades = []
+    for sym in universe:
+        df = prepared.get(sym)
+        if df is None:
+            continue
+        try:
             trades = backtest_symbol(df, market_regime, params, breadth)
             for t in trades:
                 t["symbol"] = sym.replace(".NS", "")
@@ -813,6 +831,17 @@ def _generate_trades_from_fetched(universe, fetched: dict, params) -> pd.DataFra
             .reset_index(drop=True)
         )
     return trades_df.sort_values("entry_date").reset_index(drop=True)
+
+
+def _generate_trades_from_fetched(universe, fetched: dict, params) -> pd.DataFrame:
+    """Pure computation, no network calls -- single-combination convenience
+    wrapper used by run_backtest / run_walk_forward_backtest (which only ever
+    need ONE parameter combination, so the prepare/run split doesn't matter
+    there -- it matters for the agent, which needs 54)."""
+    market_regime = fetched["market_regime"]
+    breadth = fetched.get("breadth", pd.Series(dtype=float))
+    prepared = _prepare_symbol_frames(universe, fetched, params.get("rs_lookback", 63))
+    return _run_backtest_on_prepared(universe, prepared, market_regime, breadth, params)
 
 
 def _generate_all_trades(universe, years, params) -> pd.DataFrame:
@@ -915,6 +944,16 @@ AUTO_OPTIMIZE_GRID = {
     "atr_stop_mult": [1.5, 2.0, 2.5],
 }
 
+# Faster option: every other score value, same hold/stop range -- 18 combos
+# instead of 54, for a quicker first look (e.g. if Streamlit Cloud's free
+# tier struggles with the full search). Real search-space reduction, not
+# just a progress-bar trick, so treat results from this as a rougher signal.
+AUTO_OPTIMIZE_GRID_QUICK = {
+    "score_threshold": [72, 80, 86],
+    "hold_days": [20, 30, 40],
+    "atr_stop_mult": [1.5, 2.0, 2.5],
+}
+
 # Mode presets: different starting risk posture per bucket, matching the
 # "stable = tighter/higher win-rate, dynamic = wider/bigger winners" idea.
 # These only set the STARTING params the grid search is applied on top of --
@@ -930,6 +969,7 @@ def run_auto_optimize(
     min_in_sample_trades: int = 15,
     min_out_sample_trades: int = 8,
     mode: str = None,
+    quick: bool = False,
     progress_callback=None,
 ) -> dict:
     """
@@ -941,6 +981,10 @@ def run_auto_optimize(
     onto base_params before searching (different default risk posture per
     bucket), matching the dual-bucket idea: stable favors tighter, more
     consistent exits; dynamic favors wider stops and bigger runners.
+
+    quick: use the smaller 27-combination grid instead of the full 54 --
+    trade-off search breadth for speed, useful if the full search is too
+    slow for Streamlit Cloud's free tier.
 
     The critical discipline this enforces, which manual tuning this session
     did NOT follow: the winning configuration is selected using ONLY
@@ -958,12 +1002,20 @@ def run_auto_optimize(
     if mode in MODE_PRESETS:
         effective_base.update(MODE_PRESETS[mode])
 
+    grid = AUTO_OPTIMIZE_GRID_QUICK if quick else AUTO_OPTIMIZE_GRID
+
     fetched = _fetch_universe_data(universe, years)
+    # THE speedup: compute indicators once per symbol, reuse across every
+    # combination below, instead of recomputing them inside every iteration.
+    prepared = _prepare_symbol_frames(universe, fetched, effective_base.get("rs_lookback", 63))
+    market_regime = fetched["market_regime"]
+    breadth = fetched.get("breadth", pd.Series(dtype=float))
+
     combos = [
         (st_, hd, sm)
-        for st_ in AUTO_OPTIMIZE_GRID["score_threshold"]
-        for hd in AUTO_OPTIMIZE_GRID["hold_days"]
-        for sm in AUTO_OPTIMIZE_GRID["atr_stop_mult"]
+        for st_ in grid["score_threshold"]
+        for hd in grid["hold_days"]
+        for sm in grid["atr_stop_mult"]
     ]
 
     results = []
@@ -973,7 +1025,7 @@ def run_auto_optimize(
         params["hold_days"] = hold_days
         params["atr_stop_mult"] = atr_stop_mult
 
-        trades_df = _generate_trades_from_fetched(universe, fetched, params)
+        trades_df = _run_backtest_on_prepared(universe, prepared, market_regime, breadth, params)
         if progress_callback:
             progress_callback(idx + 1, len(combos), score_threshold, hold_days, atr_stop_mult)
         if trades_df.empty:
@@ -1030,9 +1082,9 @@ def run_auto_optimize(
 
     def _stability_adjusted_score(r):
         neighbors = []
-        for d_score in AUTO_OPTIMIZE_GRID["score_threshold"]:
-            for d_hold in AUTO_OPTIMIZE_GRID["hold_days"]:
-                for d_stop in AUTO_OPTIMIZE_GRID["atr_stop_mult"]:
+        for d_score in grid["score_threshold"]:
+            for d_hold in grid["hold_days"]:
+                for d_stop in grid["atr_stop_mult"]:
                     key = (d_score, d_hold, d_stop)
                     if key == (r["score_threshold"], r["hold_days"], r["atr_stop_mult"]):
                         continue
