@@ -22,7 +22,7 @@ this session, ENGINE_VERSION below exists specifically so you can confirm a
 redeploy actually took -- check the sidebar footer against this string.
 """
 
-ENGINE_VERSION = "engine-2026-09-03-j-breadthaccuracy"
+ENGINE_VERSION = "engine-2026-09-03-l-diagnostics"
 
 import pandas as pd
 import numpy as np
@@ -632,9 +632,20 @@ def _extract_symbol_frame(data: pd.DataFrame, sym: str, universe_len: int) -> pd
         return pd.DataFrame()
     try:
         if universe_len == 1:
-            return _flatten_single_ticker_columns(data, sym).dropna(how="all")
-        frame = data[sym]
-        return frame.dropna(how="all")
+            frame = _flatten_single_ticker_columns(data, sym).dropna(how="all")
+        else:
+            frame = data[sym].dropna(how="all")
+        # Normalize timezone HERE, once, at the single extraction point every
+        # downstream consumer uses (breadth calc, backtest loop, indicators).
+        # If even one symbol among many comes back timezone-aware while
+        # others don't, building a combined index later (e.g. breadth's
+        # union across all stocks) can silently degrade to object dtype --
+        # which breaks exact/asof lookups without ever raising a visible
+        # error. Stripping tz at the source prevents that whole bug class.
+        if isinstance(frame.index, pd.DatetimeIndex) and frame.index.tz is not None:
+            frame = frame.copy()
+            frame.index = frame.index.tz_localize(None)
+        return frame
     except Exception:
         return pd.DataFrame()
 
@@ -717,6 +728,63 @@ def select_active_universe(pool: list, top_n: int, min_turnover_percentile: floa
     ranked = ranked.dropna(subset=["rs_50d"]).sort_values("rs_50d", ascending=False).reset_index(drop=True)
     active = ranked["symbol"].head(top_n).tolist()
     return active, ranked
+
+
+def debug_breadth_application(universe: list, years: float = 3) -> dict:
+    """
+    diagnose_breadth() checks whether the breadth SERIES itself is healthy.
+    This checks something different and more specific: whether the actual
+    per-row lookup performed inside backtest_symbol -- breadth.asof(date),
+    once per signal day, per symbol -- is actually succeeding, using the
+    EXACT SAME data objects the real backtest loop uses. If the series is
+    healthy but this lookup silently fails (wrong dtype, tz mismatch, etc.),
+    the gate can compute correctly and still never restrict a single trade,
+    because our fail-open design swallows lookup failures by design (to
+    avoid the earlier "blocks everything" bug) -- which also means a broken
+    lookup fails SILENTLY instead of loudly. This is how we'd catch that.
+    """
+    fetched = _fetch_universe_data(universe, years)
+    breadth = fetched.get("breadth", pd.Series(dtype=float))
+    if breadth.empty:
+        return {"error": "Breadth series is empty -- can't test lookups against nothing."}
+
+    prepared = _prepare_symbol_frames(universe, fetched)
+    if not prepared:
+        return {"error": "No prepared symbol frames -- can't run the test."}
+
+    sym, df = next(iter(prepared.items()))
+    df2 = df.reset_index()
+    if "Date" not in df2.columns:
+        df2.rename(columns={df2.columns[0]: "Date"}, inplace=True)
+
+    total, succeeded, exceptions = 0, 0, 0
+    sample_results = []
+    n_check = min(len(df2), 300)
+    for i in range(n_check):
+        date = df2.iloc[i]["Date"]
+        total += 1
+        try:
+            val = breadth.asof(date)
+            ok = pd.notna(val)
+            if ok:
+                succeeded += 1
+            if i < 5 or i >= n_check - 5:
+                sample_results.append({"date": str(date), "breadth_value": val if ok else None})
+        except Exception as e:
+            exceptions += 1
+            if len(sample_results) < 10:
+                sample_results.append({"date": str(date), "error": f"{type(e).__name__}: {e}"})
+
+    return {
+        "symbol_tested": sym,
+        "total_checked": total,
+        "succeeded": succeeded,
+        "failed_or_nan": total - succeeded - exceptions,
+        "raised_exception": exceptions,
+        "date_column_dtype": str(df2["Date"].dtype),
+        "breadth_index_dtype": str(breadth.index.dtype),
+        "sample_results": sample_results,
+    }
 
 
 def diagnose_breadth(universe: list, years: float = 3) -> dict:
