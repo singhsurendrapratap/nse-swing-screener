@@ -22,7 +22,7 @@ this session, ENGINE_VERSION below exists specifically so you can confirm a
 redeploy actually took -- check the sidebar footer against this string.
 """
 
-ENGINE_VERSION = "engine-2026-09-03-l-diagnostics"
+ENGINE_VERSION = "engine-2026-09-03-m-confirmed"
 
 import pandas as pd
 import numpy as np
@@ -811,7 +811,7 @@ def diagnose_breadth(universe: list, years: float = 3) -> dict:
         "median_pct": float(valid.median()) if len(valid) else None,
         "pct_days_below_40": float((valid < 40).mean() * 100) if len(valid) else None,
         "pct_days_below_30": float((valid < 30).mean() * 100) if len(valid) else None,
-        "last_10_values": valid.tail(10).round(1).to_dict(),
+        "last_10_values": {str(k): v for k, v in valid.tail(10).round(1).to_dict().items()},
         "n_stocks_in_universe": len(universe),
     }
 
