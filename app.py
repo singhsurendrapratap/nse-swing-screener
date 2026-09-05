@@ -26,11 +26,12 @@ from engine import (
     select_active_universe,
     get_market_breadth,
     diagnose_breadth,
+    debug_breadth_application,
     screen_today,
     evaluate_positions,
 )
 
-APP_VERSION = "app-2026-09-03-k-orderfix"
+APP_VERSION = "app-2026-09-03-l-diagnostics"
 
 POSITIONS_FILE = "positions.csv"
 POSITIONS_COLS = ["Symbol", "Entry Date", "Entry Price", "Qty", "Stop", "Target"]
@@ -203,6 +204,49 @@ with st.sidebar:
                         )
                     else:
                         st.success("Breadth data looks real and varied -- the gate should be working correctly.")
+
+            st.divider()
+            st.caption(
+                "If the numbers above look healthy but the gate still doesn't seem to change "
+                "results, the problem isn't the breadth SERIES -- it's whether each day's lookup "
+                "inside the actual backtest loop is succeeding. This checks that specifically."
+            )
+            if st.button("Run deeper lookup test (checks the actual connection point)"):
+                with st.spinner("Replicating the exact per-day lookup the backtest loop performs..."):
+                    dbg = debug_breadth_application(universe, backtest_years)
+                if "error" in dbg:
+                    st.error(dbg["error"])
+                else:
+                    st.write(f"Tested on **{dbg['symbol_tested']}**, first {dbg['total_checked']} trading days:")
+                    e1, e2, e3 = st.columns(3)
+                    e1.metric("Lookups succeeded", dbg["succeeded"])
+                    e2.metric("Returned NaN", dbg["failed_or_nan"])
+                    e3.metric("Raised an exception", dbg["raised_exception"])
+                    st.caption(
+                        f"Date column dtype: `{dbg['date_column_dtype']}` | "
+                        f"Breadth index dtype: `{dbg['breadth_index_dtype']}`"
+                    )
+                    if dbg["succeeded"] == 0:
+                        st.error(
+                            "ZERO successful lookups out of "
+                            f"{dbg['total_checked']} -- this is why the gate never restricts "
+                            "anything. The dtypes above are almost certainly mismatched "
+                            "(e.g. one is timezone-aware and the other isn't). Send this whole "
+                            "result back for a real fix -- this pinpoints the exact break."
+                        )
+                    elif dbg["succeeded"] < dbg["total_checked"] * 0.5:
+                        st.warning(
+                            f"Only {dbg['succeeded']}/{dbg['total_checked']} lookups succeeded -- "
+                            "partial failure, worth investigating further."
+                        )
+                    else:
+                        st.success(
+                            f"{dbg['succeeded']}/{dbg['total_checked']} lookups succeeded -- the "
+                            "connection is working. If results still look unchanged, the gate may "
+                            "genuinely rarely trigger for this specific combination of dates."
+                        )
+                    with st.expander("Raw sample results"):
+                        st.json(dbg["sample_results"])
 
 params = dict(DEFAULT_PARAMS)
 params.update(
