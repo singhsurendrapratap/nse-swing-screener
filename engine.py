@@ -22,8 +22,9 @@ this session, ENGINE_VERSION below exists specifically so you can confirm a
 redeploy actually took -- check the sidebar footer against this string.
 """
 
-ENGINE_VERSION = "engine-2026-09-03-m-confirmed"
+ENGINE_VERSION = "engine-2026-09-12-n-relative-rank"
 
+import math
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -70,6 +71,77 @@ DYNAMIC_UNIVERSE = [
 DEFAULT_UNIVERSE = STABLE_UNIVERSE
 MIDSMALLCAP_UNIVERSE = DYNAMIC_UNIVERSE
 
+# -----------------------------------------------------------------------------
+# SECTOR TAGGING
+# -----------------------------------------------------------------------------
+# Groundwork for sector-relative-strength scoring and sector-concentration
+# limits (both queued as separate, walk-forward-tested additions -- NOT yet
+# wired into score_setup or the daily candidate cap). For now this powers
+# a "Sector" column in the live watchlist and backtest diagnostics, so
+# concentration is at least visible before it's enforced.
+# Hand-assigned from general market knowledge (not fetched from a live
+# classification feed, matching this project's "don't trust unverified bulk
+# sourcing" stance) -- broad functional buckets, not formal GICS codes.
+SECTOR_MAP = {
+    # Nifty 50 core
+    "RELIANCE.NS": "Energy & Conglomerate", "TCS.NS": "IT", "HDFCBANK.NS": "Banking",
+    "ICICIBANK.NS": "Banking", "INFY.NS": "IT", "HINDUNILVR.NS": "FMCG",
+    "ITC.NS": "FMCG", "SBIN.NS": "Banking", "BHARTIARTL.NS": "Telecom",
+    "KOTAKBANK.NS": "Banking", "LT.NS": "Capital Goods/Engineering", "AXISBANK.NS": "Banking",
+    "BAJFINANCE.NS": "NBFC/Financial Services", "ASIANPAINT.NS": "Chemicals/Consumer",
+    "MARUTI.NS": "Auto", "SUNPHARMA.NS": "Pharma", "TITAN.NS": "Consumer Durables",
+    "ULTRACEMCO.NS": "Cement & Materials", "NESTLEIND.NS": "FMCG", "WIPRO.NS": "IT",
+    "ONGC.NS": "Energy & Oil/Gas", "NTPC.NS": "Power & Utilities", "POWERGRID.NS": "Power & Utilities",
+    "M&M.NS": "Auto", "TATAMOTORS.NS": "Auto", "TATASTEEL.NS": "Metals & Mining",
+    "ADANIENT.NS": "Diversified/Conglomerate", "ADANIPORTS.NS": "Infrastructure/Logistics",
+    "JSWSTEEL.NS": "Metals & Mining", "HCLTECH.NS": "IT", "TECHM.NS": "IT",
+    "INDUSINDBK.NS": "Banking", "BAJAJFINSV.NS": "NBFC/Financial Services",
+    "GRASIM.NS": "Cement & Materials", "CIPLA.NS": "Pharma", "DRREDDY.NS": "Pharma",
+    "EICHERMOT.NS": "Auto", "BRITANNIA.NS": "FMCG", "DIVISLAB.NS": "Pharma",
+    "HEROMOTOCO.NS": "Auto", "HINDALCO.NS": "Metals & Mining", "COALINDIA.NS": "Energy & Oil/Gas",
+    "BPCL.NS": "Energy & Oil/Gas", "SBILIFE.NS": "Insurance", "HDFCLIFE.NS": "Insurance",
+    "APOLLOHOSP.NS": "Healthcare", "UPL.NS": "Chemicals/Agri", "BAJAJ-AUTO.NS": "Auto",
+    "TATACONSUM.NS": "FMCG",
+    # Nifty Next 50 / other verified large-caps
+    "ADANIPOWER.NS": "Power & Utilities", "HAL.NS": "Capital Goods/Engineering",
+    "TVSMOTOR.NS": "Auto", "VBL.NS": "FMCG", "TATAPOWER.NS": "Power & Utilities",
+    "CHOLAFIN.NS": "NBFC/Financial Services", "VEDL.NS": "Metals & Mining",
+    "ADANIGREEN.NS": "Power & Utilities", "ADANIENSOL.NS": "Power & Utilities",
+    "PIDILITIND.NS": "Chemicals/Consumer", "SIEMENS.NS": "Capital Goods/Engineering",
+    "ABB.NS": "Capital Goods/Engineering", "HAVELLS.NS": "Consumer Durables",
+    "DABUR.NS": "FMCG", "COLPAL.NS": "FMCG", "GODREJCP.NS": "FMCG",
+    "BANKBARODA.NS": "Banking", "CANBK.NS": "Banking", "PNB.NS": "Banking",
+    "LTIM.NS": "IT", "NAUKRI.NS": "Retail/Internet", "ZYDUSLIFE.NS": "Pharma",
+    "UNITDSPR.NS": "FMCG", "SHREECEM.NS": "Cement & Materials", "AMBUJACEM.NS": "Cement & Materials",
+    "DMART.NS": "Retail/Internet", "ICICIPRULI.NS": "Insurance", "ICICIGI.NS": "Insurance",
+    "SBICARD.NS": "NBFC/Financial Services", "HDFCAMC.NS": "NBFC/Financial Services",
+    # Dynamic universe
+    "FEDERALBNK.NS": "Banking", "MCX.NS": "Capital Markets/Exchanges", "SUZLON.NS": "Capital Goods/Engineering",
+    "BHEL.NS": "Capital Goods/Engineering", "LAURUSLABS.NS": "Pharma", "POLYCAB.NS": "Capital Goods/Engineering",
+    "ABCAPITAL.NS": "NBFC/Financial Services", "INDIANB.NS": "Banking", "PAGEIND.NS": "Textiles/Apparel",
+    "MPHASIS.NS": "IT", "PERSISTENT.NS": "IT", "COFORGE.NS": "IT", "LTTS.NS": "IT",
+    "TATACOMM.NS": "Telecom", "VOLTAS.NS": "Consumer Durables", "TRENT.NS": "Retail/Internet",
+    "GODREJPROP.NS": "Realty", "OBEROIRLTY.NS": "Realty", "PHOENIXLTD.NS": "Realty",
+    "INDHOTEL.NS": "Hospitality/Travel", "JUBLFOOD.NS": "FMCG", "DEEPAKNTR.NS": "Chemicals/Agri",
+    "PIIND.NS": "Chemicals/Agri", "SRF.NS": "Chemicals/Agri", "GUJGASLTD.NS": "Energy & Oil/Gas",
+    "ASTRAL.NS": "Capital Goods/Engineering", "DIXON.NS": "Consumer Durables", "AUBANK.NS": "Banking",
+    "IDFCFIRSTB.NS": "Banking", "BANDHANBNK.NS": "Banking", "RBLBANK.NS": "Banking",
+    "IEX.NS": "Capital Markets/Exchanges", "CDSL.NS": "Capital Markets/Exchanges", "BSE.NS": "Capital Markets/Exchanges",
+    "CROMPTON.NS": "Consumer Durables", "WHIRLPOOL.NS": "Consumer Durables", "ESCORTS.NS": "Auto",
+    "BALKRISIND.NS": "Auto Ancillary", "MOTHERSON.NS": "Auto Ancillary", "ASHOKLEY.NS": "Auto",
+    "BHARATFORG.NS": "Auto Ancillary", "CUMMINSIND.NS": "Capital Goods/Engineering", "LUPIN.NS": "Pharma",
+    "ALKEM.NS": "Pharma", "TORNTPHARM.NS": "Pharma", "GLENMARK.NS": "Pharma",
+    "NATIONALUM.NS": "Metals & Mining", "HINDZINC.NS": "Metals & Mining", "JINDALSTEL.NS": "Metals & Mining",
+    "NMDC.NS": "Metals & Mining", "SAIL.NS": "Metals & Mining", "RECLTD.NS": "NBFC/Financial Services",
+    "PFC.NS": "NBFC/Financial Services", "CONCOR.NS": "Infrastructure/Logistics",
+    "GMRINFRA.NS": "Infrastructure/Logistics", "IRCTC.NS": "Retail/Internet",
+}
+
+
+def get_sector(symbol: str) -> str:
+    return SECTOR_MAP.get(symbol, "Other")
+
+
 # CAVEAT, worth repeating: both lists are TODAY's known liquid, established
 # names, tested against PAST years. Stocks that got delisted or crashed out
 # of relevance in the meantime aren't included -- this is survivorship bias,
@@ -102,6 +174,20 @@ DEFAULT_PARAMS = dict(
     rsi_low=45,
     rsi_high=70,
     min_earnings_growth=0.10,
+
+    # Selection mode -- NEW.
+    # "absolute": legacy behaviour -- a candidate enters if score >= score_threshold,
+    #   a fixed number that means something different in a strong month vs a quiet one.
+    # "relative" (new default): a candidate must ALSO be in the top rank_top_pct% of
+    #   THAT DAY's other candidates that already cleared score_threshold. This is the
+    #   cross-sectional-ranking approach the momentum literature (e.g. Jegadeesh &
+    #   Titman) actually tests -- rank stocks against each other today, not against a
+    #   static number tuned on the past. score_threshold still acts as an absolute
+    #   quality floor underneath the rank filter; it isn't removed, just no longer
+    #   the only bar. UNTESTED until walk-forward confirms it -- same discipline as
+    #   the breadth gate before it.
+    selection_mode="relative",
+    rank_top_pct=25,
 
     # Fixed research constants; change only after out-of-sample testing.
     rs_lookback=63,
@@ -540,43 +626,161 @@ def simulate_layered_exit(df: pd.DataFrame, i: int, entry_price: float, atr_entr
     return r_multiple, days_held, exit_index, exit_reason
 
 # -----------------------------------------------------------------------------
+# CROSS-SECTIONAL RANKING (relative selection mode)
+# -----------------------------------------------------------------------------
+#
+# score_setup()'s output (score + mandatory_ok) does NOT depend on
+# score_threshold, hold_days, or atr_stop_mult -- the three things the
+# auto-optimize agent's grid actually searches over. That means the entire
+# scored table below can be computed ONCE per backtest/agent run and reused
+# across every grid combination, exactly the same "prepare once, reuse many
+# times" pattern _prepare_symbol_frames already uses for indicators. Skipping
+# this and rescoring per grid combination would multiply the agent's runtime
+# by the grid size for no benefit.
+
+def _rank_cutoff_from_scores(scores: list, rank_top_pct: float):
+    """
+    Shared by both the backtest score table and the live screener, so
+    "what counts as top rank_top_pct%" means exactly the same thing in a
+    backtest as it does in the live watchlist. Returns the score marking
+    the top rank_top_pct% of `scores` (already filtered to whatever floor
+    applies), or None if `scores` is empty.
+    """
+    s = sorted(scores, reverse=True)
+    n = len(s)
+    if n == 0:
+        return None
+    if n == 1:
+        return float(s[0])
+    rank_top_pct = max(1, min(100, rank_top_pct))
+    k = min(n, max(1, math.ceil(n * rank_top_pct / 100)))
+    return float(s[k - 1])
+
+
+def _compute_setup_score_table(universe, prepared: dict, market_regime: pd.Series,
+                                breadth: pd.Series, params: dict) -> pd.DataFrame:
+    """
+    Scores every (symbol, date) row across the whole prepared universe, on
+    every day the market itself was tradeable. Returns a long DataFrame:
+    columns [date, symbol, score, mandatory_ok]. This is the raw material
+    cross-sectional ranking needs -- "how did every stock's setup look
+    today", not just the one stock a per-symbol loop happens to be looking
+    at when it isn't already mid-trade.
+    """
+    min_breadth = params.get("min_breadth_pct")
+
+    all_dates = set()
+    for sym in universe:
+        df = prepared.get(sym)
+        if df is not None and not df.empty:
+            all_dates.update(df.index)
+    ok_dates = {d for d in all_dates if _market_ok_for_date(d, market_regime, breadth, min_breadth)}
+
+    rows = []
+    for sym in universe:
+        df = prepared.get(sym)
+        if df is None or df.empty:
+            continue
+        for date, row in df.iterrows():
+            if date not in ok_dates:
+                continue
+            result = score_setup(row, True, params, include_earnings=False)
+            rows.append((date, sym, result["score"], result["mandatory_ok"]))
+
+    return pd.DataFrame(rows, columns=["date", "symbol", "score", "mandatory_ok"])
+
+
+def _daily_cutoffs_from_score_table(score_table: pd.DataFrame, score_threshold: float,
+                                     rank_top_pct: float) -> pd.Series:
+    """
+    Cheap re-use of an already-scored table: for every date, among the
+    symbols that already clear the absolute floor (score_threshold) AND the
+    mandatory gates, find the score marking the top rank_top_pct% of THAT
+    DAY's qualifying names. A stock needs to clear this cutoff (in addition
+    to the existing floor) to be cross-sectionally eligible.
+
+    On a strong day with many genuinely good setups, this cutoff rises well
+    above the floor and only the best few qualify. On a quiet day with one
+    or two decent setups, it falls back to whatever's actually available --
+    the bar moves with the day's real opportunity set instead of meaning a
+    different thing in a hot month vs. a quiet one.
+    """
+    if score_table.empty:
+        return pd.Series(dtype=float)
+    elig = score_table[score_table["mandatory_ok"] & (score_table["score"] >= score_threshold)]
+    if elig.empty:
+        return pd.Series(dtype=float)
+    rank_top_pct = max(1, min(100, rank_top_pct))
+
+    return elig.groupby("date")["score"].apply(lambda g: _rank_cutoff_from_scores(g.tolist(), rank_top_pct))
+
+
+# -----------------------------------------------------------------------------
 # BACKTEST
 # -----------------------------------------------------------------------------
 
-def backtest_symbol(df: pd.DataFrame, market_regime: pd.Series, params: dict, breadth: pd.Series = None) -> list:
+def _market_ok_for_date(date, market_regime: pd.Series, breadth: pd.Series, min_breadth_pct) -> bool:
+    """
+    Single source of truth for "is today tradeable" -- Nifty regime plus the
+    optional breadth gate. Factored out so the backtest loop and the new
+    cross-sectional score table (below) can never silently disagree about
+    which days count, which would otherwise be exactly the kind of
+    hard-to-spot bug this project has hit before.
+    """
+    mkt_ok = bool(market_regime.get(date, False))
+    if min_breadth_pct and breadth is not None and not breadth.empty:
+        # asof = most recent breadth reading AT OR BEFORE this date. Robust to
+        # breadth's index (a union of many stocks' individual date sets) not
+        # having an exact match for every single date -- unlike an exact-match
+        # .get(), which would silently fail-closed (block every trade) on any
+        # tiny misalignment, exactly the kind of bug that can zero out an
+        # entire backtest without an obvious error anywhere.
+        try:
+            today_breadth = breadth.asof(date)
+        except Exception:
+            today_breadth = None
+        if pd.notna(today_breadth) and today_breadth < min_breadth_pct:
+            mkt_ok = False  # market too narrow today, even if Nifty itself looks fine
+        # If today_breadth is NaN/unavailable, fail OPEN -- don't let a data gap
+        # silently block every trade. The gate should narrow results when it has
+        # real data, not erase the whole backtest when it doesn't.
+    return mkt_ok
+
+
+def backtest_symbol(df: pd.DataFrame, market_regime: pd.Series, params: dict, breadth: pd.Series = None,
+                     daily_cutoffs: pd.Series = None) -> list:
+    """
+    daily_cutoffs: optional, only used when params["selection_mode"] == "relative".
+    A per-date Series (from _daily_cutoffs_from_score_table) giving the minimum
+    score required to be in that day's top rank_top_pct% of candidates. When
+    None or selection_mode is "absolute", behaviour is unchanged from before --
+    entry is score_threshold alone.
+    """
     trades = []
     df = df.reset_index()
     if "Date" not in df.columns:
         df.rename(columns={df.columns[0]: "Date"}, inplace=True)
     breadth = breadth if breadth is not None else pd.Series(dtype=float)
+    selection_mode = params.get("selection_mode", "absolute")
+    score_threshold = params.get("score_threshold", 78)
 
     i = 0
     while i < len(df) - 2:
         row = df.iloc[i]
         date = row["Date"]
-        mkt_ok = bool(market_regime.get(date, False))
-
-        min_breadth = params.get("min_breadth_pct")
-        if min_breadth and not breadth.empty:
-            # asof = most recent breadth reading AT OR BEFORE this date. Robust to
-            # breadth's index (a union of many stocks' individual date sets) not
-            # having an exact match for every single date -- unlike an exact-match
-            # .get(), which would silently fail-closed (block every trade) on any
-            # tiny misalignment, exactly the kind of bug that can zero out an
-            # entire backtest without an obvious error anywhere.
-            try:
-                today_breadth = breadth.asof(date)
-            except Exception:
-                today_breadth = None
-            if pd.notna(today_breadth) and today_breadth < min_breadth:
-                mkt_ok = False  # market too narrow today, even if Nifty itself looks fine
-            # If today_breadth is NaN/unavailable, fail OPEN -- don't let a data gap
-            # silently block every trade. The gate should narrow results when it has
-            # real data, not erase the whole backtest when it doesn't.
+        mkt_ok = _market_ok_for_date(date, market_regime, breadth, params.get("min_breadth_pct"))
 
         result = score_setup(row, mkt_ok, params, include_earnings=False)
 
-        if result["mandatory_ok"] and result["score"] >= params.get("score_threshold", 78):
+        passes_floor = result["mandatory_ok"] and result["score"] >= score_threshold
+        if passes_floor and selection_mode == "relative" and daily_cutoffs is not None:
+            day_cutoff = daily_cutoffs.get(date)
+            # No cutoff recorded for this date (e.g. nothing cleared the floor
+            # anywhere in the universe that day) -- nothing to rank against,
+            # so don't block on a missing lookup.
+            passes_floor = day_cutoff is None or result["score"] >= day_cutoff
+
+        if passes_floor:
             entry_day = df.iloc[i + 1]
             gap_pct = max(0.0, (entry_day["Open"] / row["Close"] - 1) * 100) if row["Close"] else 0.0
             effective_friction = params["friction_pct"] + gap_pct / 100 * params.get("gap_slippage_frac", 0.0)
@@ -903,19 +1107,37 @@ def _prepare_symbol_frames(universe, fetched: dict, rs_lookback: int = 63) -> di
     return prepared
 
 
-def _run_backtest_on_prepared(universe, prepared: dict, market_regime, breadth, params) -> pd.DataFrame:
+def _run_backtest_on_prepared(universe, prepared: dict, market_regime, breadth, params,
+                               score_table: pd.DataFrame = None) -> pd.DataFrame:
     """The cheap, params-DEPENDENT part -- runs backtest_symbol against
     already-prepared (indicators computed) dataframes. Safe to call many
-    times with different params once _prepare_symbol_frames has run once."""
+    times with different params once _prepare_symbol_frames has run once.
+
+    score_table: optional pre-scored table from _compute_setup_score_table,
+    reused across many calls (e.g. by the auto-optimize agent's grid search)
+    so relative mode doesn't re-score the whole universe on every combination.
+    If not given and selection_mode is "relative", it's computed here once
+    for this single call (fine for run_backtest / run_walk_forward_backtest,
+    which only ever need one combination)."""
+    daily_cutoffs = None
+    if params.get("selection_mode") == "relative":
+        table = score_table
+        if table is None:
+            table = _compute_setup_score_table(universe, prepared, market_regime, breadth, params)
+        daily_cutoffs = _daily_cutoffs_from_score_table(
+            table, params.get("score_threshold", 78), params.get("rank_top_pct", 25)
+        )
+
     all_trades = []
     for sym in universe:
         df = prepared.get(sym)
         if df is None:
             continue
         try:
-            trades = backtest_symbol(df, market_regime, params, breadth)
+            trades = backtest_symbol(df, market_regime, params, breadth, daily_cutoffs=daily_cutoffs)
             for t in trades:
                 t["symbol"] = sym.replace(".NS", "")
+                t["sector"] = get_sector(sym)
             all_trades.extend(trades)
         except Exception:
             continue
@@ -1114,6 +1336,15 @@ def run_auto_optimize(
     market_regime = fetched["market_regime"]
     breadth = fetched.get("breadth", pd.Series(dtype=float))
 
+    # Same speedup, extended to relative mode: score_setup's output doesn't
+    # depend on score_threshold/hold_days/atr_stop_mult (the 3 things this
+    # grid actually varies), so score every row ONCE here and reuse it for
+    # every combination below instead of re-scoring the whole universe 54
+    # times over.
+    score_table = None
+    if effective_base.get("selection_mode") == "relative":
+        score_table = _compute_setup_score_table(universe, prepared, market_regime, breadth, effective_base)
+
     combos = [
         (st_, hd, sm)
         for st_ in grid["score_threshold"]
@@ -1128,7 +1359,8 @@ def run_auto_optimize(
         params["hold_days"] = hold_days
         params["atr_stop_mult"] = atr_stop_mult
 
-        trades_df = _run_backtest_on_prepared(universe, prepared, market_regime, breadth, params)
+        trades_df = _run_backtest_on_prepared(universe, prepared, market_regime, breadth, params,
+                                               score_table=score_table)
         if progress_callback:
             progress_callback(idx + 1, len(combos), score_threshold, hold_days, atr_stop_mult)
         if trades_df.empty:
@@ -1281,8 +1513,14 @@ def screen_today(universe, capital, risk_pct, params) -> tuple[pd.DataFrame, boo
         progress=False, threads=True
     )
     max_risk_amount = capital * risk_pct
-    candidates = []
+    selection_mode = params.get("selection_mode", "absolute")
+    score_threshold = params.get("score_threshold", 78)
 
+    # PASS 1: technical score only (no earnings lookups yet -- those are a
+    # per-symbol network call, so we narrow the field first). Every symbol
+    # that clears the existing absolute floor (mandatory gates + score
+    # threshold) is kept here, same bar as before.
+    tech_candidates = []
     for sym in universe:
         try:
             df = _extract_symbol_frame(data, sym, len(universe))
@@ -1294,10 +1532,31 @@ def screen_today(universe, capital, risk_pct, params) -> tuple[pd.DataFrame, boo
             if pd.isna(last.get("SMA200")):
                 continue
 
-            # Earnings is checked only after the technical score passes.
             tech = score_setup(last, is_bullish, params, include_earnings=False)
-            if not tech["mandatory_ok"] or tech["score"] < params.get("score_threshold", 78):
+            if not tech["mandatory_ok"] or tech["score"] < score_threshold:
                 continue
+            tech_candidates.append({"symbol": sym, "last": last, "tech": tech})
+        except Exception:
+            continue
+
+    # RELATIVE mode: narrow further to today's top rank_top_pct% among
+    # whatever cleared the floor above -- the same cross-sectional-ranking
+    # logic the backtest uses, applied to today's single day instead of a
+    # historical date range. On a strong day this cuts hard; on a quiet
+    # day with only one or two decent setups, everyone that's left still
+    # qualifies.
+    if selection_mode == "relative" and tech_candidates:
+        today_cutoff = _rank_cutoff_from_scores(
+            [c["tech"]["score"] for c in tech_candidates], params.get("rank_top_pct", 25)
+        )
+        if today_cutoff is not None:
+            tech_candidates = [c for c in tech_candidates if c["tech"]["score"] >= today_cutoff]
+
+    # PASS 2: only the survivors get the (slower, per-symbol) earnings check.
+    candidates = []
+    for cand in tech_candidates:
+        try:
+            sym, last, tech = cand["symbol"], cand["last"], cand["tech"]
 
             earnings_growth = get_earnings_growth(sym)
             live = score_setup(
@@ -1318,6 +1577,7 @@ def screen_today(universe, capital, risk_pct, params) -> tuple[pd.DataFrame, boo
 
             candidates.append({
                 "Symbol": sym.replace(".NS", ""),
+                "Sector": get_sector(sym),
                 "Quality Score": tech["score"],
                 "Regime": tech["regime"],
                 "Buy Near": round(entry, 2),
