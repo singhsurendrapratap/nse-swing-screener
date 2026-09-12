@@ -31,7 +31,7 @@ from engine import (
     evaluate_positions,
 )
 
-APP_VERSION = "app-2026-09-03-l-diagnostics"
+APP_VERSION = "app-2026-09-12-m-relative-rank"
 
 POSITIONS_FILE = "positions.csv"
 POSITIONS_COLS = ["Symbol", "Entry Date", "Entry Price", "Qty", "Stop", "Target"]
@@ -79,7 +79,9 @@ with st.sidebar:
         "Minimum quality score (0–100)", 50, 95,
         int(DEFAULT_PARAMS.get("score_threshold", 78)), 1,
         key="score_threshold_key",
-        help="Start around 78. Do not optimize this to the historical sample. "
+        help="This is the quality FLOOR. In Relative mode (below) it's the first "
+             "cut, not the only one — candidates also have to rank in the top X% "
+             "of that day's field. Do not optimize this to the historical sample. "
              "Use walk-forward/out-of-sample testing before changing it. "
              "The AI Agent tab can set this for you automatically."
     )
@@ -89,6 +91,31 @@ with st.sidebar:
         help="The screener ranks candidates and only returns the best N. "
              "This is deliberately selective."
     )
+
+    selection_mode_label = st.radio(
+        "How candidates are selected",
+        ["🆕 Relative — rank against today's other setups",
+         "Absolute — fixed score threshold only (legacy)"],
+        index=0,
+        help="RELATIVE (new): a candidate must ALSO be in the top X% of the OTHER "
+             "candidates that cleared the score floor on that same day — the "
+             "selection bar moves with how many genuinely good setups exist that "
+             "day, instead of a fixed number tuned on the past. This is how most "
+             "systematic momentum research actually selects stocks. ABSOLUTE: the "
+             "original behavior — score ≥ threshold, full stop. UNTESTED until "
+             "you walk-forward validate it, same discipline as everything else.",
+    )
+    selection_mode = "relative" if selection_mode_label.startswith("🆕") else "absolute"
+    rank_top_pct = DEFAULT_PARAMS.get("rank_top_pct", 25)
+    if selection_mode == "relative":
+        rank_top_pct = st.slider(
+            "Only take the top X% of that day's qualifying setups", 5, 100,
+            int(DEFAULT_PARAMS.get("rank_top_pct", 25)), 5,
+            help="The score threshold above still acts as a quality floor. This "
+                 "narrows further: on a day with many strong setups, only the "
+                 "best X% of them qualify. On a quiet day with one or two decent "
+                 "setups, everyone that cleared the floor still gets through.",
+        )
 
     st.divider()
     st.subheader("Quality gates")
@@ -252,6 +279,8 @@ params = dict(DEFAULT_PARAMS)
 params.update(
     score_threshold=score_threshold,
     max_trades_per_day=max_trades,
+    selection_mode=selection_mode,
+    rank_top_pct=rank_top_pct,
     rsi_low=rsi_low,
     rsi_high=rsi_high,
     min_earnings_growth=min_earnings_growth,
@@ -328,6 +357,12 @@ with tab0:
         value=False,
         help="Use this if the full search times out or feels too slow on your connection. "
              "Trades search breadth for speed; treat quick-mode results as a rougher signal.",
+    )
+    st.caption(
+        f"Selection mode is inherited from the sidebar: **"
+        f"{'Relative -- top ' + str(rank_top_pct) + '% ranked' if selection_mode == 'relative' else 'Absolute threshold (legacy)'}"
+        f"**. The grid below still only searches score threshold, max hold, and stop "
+        f"width — deliberately narrow, same reasoning as always."
     )
 
     if st.button("🤖 Run AI Agent — Find My Best Settings", type="primary"):
@@ -419,12 +454,20 @@ with tab0:
 # -----------------------------------------------------------------------------
 with tab1:
     st.subheader("Today's highest-quality long setups")
-    st.write(
-        f"The screener first requires a bullish Nifty regime, then applies the "
-        f"technical quality engine. Only candidates scoring **{score_threshold}/100+** "
-        f"and passing the live earnings gate are returned. The list is capped at "
-        f"**{max_trades} trade(s)** and ranked by quality."
-    )
+    if selection_mode == "relative":
+        st.write(
+            f"The screener first requires a bullish Nifty regime, then applies the "
+            f"technical quality engine. Candidates need **{score_threshold}/100+** AND "
+            f"must rank in the **top {rank_top_pct}%** of today's qualifying field, plus "
+            f"pass the live earnings gate. The list is capped at **{max_trades} trade(s)**."
+        )
+    else:
+        st.write(
+            f"The screener first requires a bullish Nifty regime, then applies the "
+            f"technical quality engine. Only candidates scoring **{score_threshold}/100+** "
+            f"and passing the live earnings gate are returned. The list is capped at "
+            f"**{max_trades} trade(s)** and ranked by quality."
+        )
     st.info(
         "Best practice: run the daily screen after the market close if you want a "
         "clean completed daily candle. If you trade intraday, treat the result as a "
@@ -513,8 +556,11 @@ with tab1:
 # -----------------------------------------------------------------------------
 with tab2:
     st.subheader("Research the exact selection + exit rules")
+    mode_caption = (
+        f"top {rank_top_pct}% ranked (relative)" if selection_mode == "relative" else "absolute threshold"
+    )
     st.caption(
-        f"Quality score ≥ {score_threshold}/100 | Max {max_trades} trades/day | "
+        f"Quality score ≥ {score_threshold}/100, {mode_caption} | Max {max_trades} trades/day | "
         f"Stop {atr_stop}×ATR | BE {breakeven_r}R | Partial {partial_r}R | "
         f"Runner {runner_trail_mult}×ATR | {hold_days}-day max hold"
     )
@@ -587,6 +633,21 @@ with tab2:
                         TotalR=("r_multiple", "sum"),
                     )
                     st.dataframe(by_score.round(3), use_container_width=True)
+
+                    if "sector" in trades_df.columns:
+                        st.subheader("Performance by sector")
+                        st.caption(
+                            "Not a filter yet -- just visibility. If a handful of sectors "
+                            "account for most trades or most of the R, that's concentration "
+                            "risk hiding inside what looks like several independent trades."
+                        )
+                        by_sector = trades_df.groupby("sector").agg(
+                            Trades=("r_multiple", "size"),
+                            WinRate=("outcome", lambda x: (x == "win").mean() * 100),
+                            ExpectancyR=("r_multiple", "mean"),
+                            TotalR=("r_multiple", "sum"),
+                        ).sort_values("Trades", ascending=False)
+                        st.dataframe(by_sector.round(3), use_container_width=True)
 
                     st.subheader("Performance by year")
                     tmp = trades_df.copy()
