@@ -22,6 +22,7 @@ from engine import (
     ENGINE_VERSION,
     run_backtest,
     run_walk_forward_backtest,
+    run_multi_window_walk_forward,
     run_auto_optimize,
     select_active_universe,
     get_market_breadth,
@@ -31,7 +32,7 @@ from engine import (
     evaluate_positions,
 )
 
-APP_VERSION = "app-2026-09-13-b-contraction-slider"
+APP_VERSION = "app-2026-09-13-c-multi-window-wf"
 
 POSITIONS_FILE = "positions.csv"
 POSITIONS_COLS = ["Symbol", "Entry Date", "Entry Price", "Qty", "Stop", "Target"]
@@ -805,6 +806,98 @@ with tab2:
         "study which characteristics separate winners from losers instead of "
         "blindly optimizing indicator thresholds."
     )
+
+    st.divider()
+    st.subheader("🧪🧪 Multi-window walk-forward")
+    st.write(
+        "A single split date is one throw of the dice -- the SAME frozen config can "
+        "look meaningfully better against one split and meaningfully worse against "
+        "another, purely because of which specific months ended up in the "
+        "out-of-sample slice. This runs the exact same frozen settings (whatever the "
+        "sidebar is set to right now) against **several** out-of-sample start dates "
+        "at once and reports how many actually generalized, instead of trusting "
+        "whichever single split you happened to pick."
+    )
+    n_windows = st.slider("Number of split windows to test", 2, 6, 4, key="mw_n_windows")
+    _default_mw_dates = [date(2022, 7, 1), date(2023, 1, 1), date(2023, 7, 1),
+                          date(2024, 1, 1), date(2024, 7, 1), date(2025, 1, 1)][-n_windows:]
+    mw_cols = st.columns(min(n_windows, 3))
+    mw_split_dates = []
+    for i in range(n_windows):
+        d = mw_cols[i % len(mw_cols)].date_input(
+            f"Split {i + 1}", value=_default_mw_dates[i], key=f"mw_split_{i}"
+        )
+        mw_split_dates.append(d)
+
+    if st.button("🧪🧪 Run multi-window walk-forward"):
+        if not universe:
+            st.error("Select at least one ticker.")
+        elif partial_r <= breakeven_r:
+            st.error("Fix the exit settings first.")
+        elif len(set(mw_split_dates)) != len(mw_split_dates):
+            st.error("Split dates must be distinct.")
+        else:
+            with st.spinner(f"Generating trades across {backtest_years} years once, then testing "
+                             f"{n_windows} different splits..."):
+                mw = run_multi_window_walk_forward(
+                    universe, backtest_years, params,
+                    split_dates=[d.isoformat() for d in sorted(mw_split_dates)]
+                )
+
+            if not mw.get("windows"):
+                st.info("Not enough trades in this window to split meaningfully -- widen years or universe.")
+            else:
+                rows = []
+                for w in mw["windows"]:
+                    ins, oos = w["in_sample"], w["out_sample"]
+                    n_in, n_out = ins.get("total_trades", 0), oos.get("total_trades", 0)
+                    if n_in < 10 or n_out < 10:
+                        verdict = "⚪ too few trades to test"
+                    elif oos.get("expectancy_r", -999) >= ins.get("expectancy_r", 0) - 0.05:
+                        verdict = "✅ generalized"
+                    else:
+                        verdict = "❌ did not generalize"
+                    rows.append({
+                        "Split date": w["split_date"],
+                        "In-sample trades": n_in,
+                        "In-sample expectancy": round(ins.get("expectancy_r", 0), 3) if ins else None,
+                        "OOS trades": n_out,
+                        "OOS expectancy": round(oos.get("expectancy_r", 0), 3) if oos else None,
+                        "Verdict": verdict,
+                    })
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+                n_valid = mw.get("n_valid_windows", 0)
+                n_gen = mw.get("n_generalized", 0)
+                if n_valid == 0:
+                    st.warning("No window had enough trades on both sides to count. Widen years or universe.")
+                elif n_gen == n_valid:
+                    st.success(
+                        f"Generalized in all {n_valid} testable windows. That's the strongest signal "
+                        f"this configuration produces so far -- still not proof of a durable edge, "
+                        f"but consistent across time rather than a fit to one lucky window."
+                    )
+                elif n_gen == 0:
+                    st.error(
+                        f"Did not generalize in ANY of the {n_valid} testable windows. This is a "
+                        f"strong, consistent overfitting signal -- not just one unlucky split."
+                    )
+                else:
+                    st.warning(
+                        f"Generalized in {n_gen} of {n_valid} testable windows. A configuration that "
+                        f"only wins some of the time it's tested isn't reliable -- treat this as "
+                        f"inconsistent, not validated, regardless of which single window looked best."
+                    )
+
+                mean_oos = mw.get("oos_expectancy_mean")
+                std_oos = mw.get("oos_expectancy_std")
+                if mean_oos is not None:
+                    st.caption(
+                        f"Out-of-sample expectancy across windows: mean **{mean_oos:.3f}R**, "
+                        f"spread (std dev) **{std_oos:.3f}R**. A wide spread relative to the mean "
+                        f"means the result depends heavily on which window you happened to test -- "
+                        f"exactly the instability a single split can't show you."
+                    )
 
 # -----------------------------------------------------------------------------
 # POSITIONS
