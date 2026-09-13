@@ -27,12 +27,13 @@ from engine import (
     select_active_universe,
     get_market_breadth,
     diagnose_breadth,
+    diagnose_regime_by_period,
     debug_breadth_application,
     screen_today,
     evaluate_positions,
 )
 
-APP_VERSION = "app-2026-09-13-d-breakout-confirmation"
+APP_VERSION = "app-2026-09-13-e-sector-rs-regime-diag"
 
 POSITIONS_FILE = "positions.csv"
 POSITIONS_COLS = ["Symbol", "Entry Date", "Entry Price", "Qty", "Stop", "Target"]
@@ -137,6 +138,25 @@ with st.sidebar:
             help="How many days price must hold above the breakout level before entry. "
                  "Entry happens the day AFTER the last confirmation day. More days = fewer, "
                  "later, more-confirmed entries; you'll give up some of the early move.",
+        )
+
+    require_sector_strength = st.checkbox(
+        "🆕 Require sector strength (stock's sector must also beat Nifty)",
+        value=False,
+        help="UNTESTED, new hypothesis, motivated by industry-momentum research: momentum "
+             "tends to cluster by sector, not just by individual stock. Builds a synthetic "
+             "sector index from every universe stock sharing that sector tag, then requires "
+             "it to be outperforming the Nifty too -- not just the individual stock. "
+             "BACKTEST/AGENT ONLY -- this does not affect the live watchlist below, since "
+             "that screener doesn't build a full-universe sector proxy the way the backtest "
+             "does.",
+    )
+    min_sector_rs = 0.0
+    if require_sector_strength:
+        min_sector_rs = st.slider(
+            "Minimum sector relative strength vs Nifty (%)", -10.0, 20.0, 0.0, 0.5,
+            help="0 = sector must simply be beating the Nifty, not falling behind it. "
+                 "Positive = require a real cushion of sector outperformance, not just barely ahead.",
         )
 
     st.divider()
@@ -249,6 +269,36 @@ with st.sidebar:
     )
     st.caption(f"Universe: **{len(universe)} tickers** selected \u00d7 **{backtest_years} years** \u2192 more of both means a bigger, more trustworthy trade sample.")
 
+    with st.expander("🔍 Did the regime gate actually shut off during known corrections?"):
+        st.caption(
+            "Checks the market-regime gate (and breadth gate, if enabled) against 3 known "
+            "FII-outflow-driven corrections in Indian market history -- not tuned or "
+            "cherry-picked to this app's own results. If the gate stayed mostly \"on\" through "
+            "a period where the strategy is known to lose money, that's the gap to close."
+        )
+        if st.button("Run regime-by-period diagnostic"):
+            with st.spinner("Computing regime series across the full lookback..."):
+                min_b = min_breadth_pct if use_breadth_gate else None
+                regime_diag = diagnose_regime_by_period(universe, backtest_years, min_breadth_pct=min_b)
+            if "error" in regime_diag:
+                st.error(regime_diag["error"])
+            else:
+                rows = []
+                for label, d in regime_diag.items():
+                    row = {"Period": label, "Days": d.get("n_days", 0),
+                           "% days regime bullish": d.get("pct_days_regime_bullish")}
+                    if "pct_days_breadth_would_also_block" in d:
+                        row["% days breadth would ALSO block"] = d["pct_days_breadth_would_also_block"]
+                    rows.append(row)
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                st.caption(
+                    "If a known-bad period shows a HIGH % bullish (close to the trending "
+                    "period's number), the gate isn't distinguishing that period from a "
+                    "healthy one -- tightening it is likely to help. If it's already LOW, "
+                    "the gate is already doing its job and the losses are coming from trades "
+                    "taken on the (fewer) days it stayed on, not from over-trading."
+                )
+
     if use_breadth_gate:
         with st.expander("🔍 Diagnose actual breadth values (do this before trusting the gate)"):
             st.caption(
@@ -337,6 +387,8 @@ params.update(
     rank_top_pct=rank_top_pct,
     require_confirmation=require_confirmation,
     confirmation_days=confirmation_days,
+    require_sector_strength=require_sector_strength,
+    min_sector_rs=min_sector_rs,
     rsi_low=rsi_low,
     rsi_high=rsi_high,
     min_earnings_growth=min_earnings_growth,
@@ -525,6 +577,12 @@ with tab1:
             f"and passing the live earnings gate are returned. The list is capped at "
             f"**{max_trades} trade(s)** and ranked by quality."
         )
+    if require_sector_strength:
+        st.info(
+            "Note: \"Require sector strength\" is ON in the sidebar but only applies to the "
+            "backtest/walk-forward/agent tabs, not this live list -- see the checkbox's help "
+            "text for why."
+        )
     st.info(
         "Best practice: run the daily screen after the market close if you want a "
         "clean completed daily candle. If you trade intraday, treat the result as a "
@@ -619,10 +677,13 @@ with tab2:
     confirm_caption = (
         f" | 🆕 {confirmation_days}-day breakout confirmation required" if require_confirmation else ""
     )
+    sector_caption = (
+        f" | 🆕 sector RS \u2265 {min_sector_rs}%" if require_sector_strength else ""
+    )
     st.caption(
         f"Quality score ≥ {score_threshold}/100, {mode_caption} | Max {max_trades} trades/day | "
         f"Stop {atr_stop}×ATR | BE {breakeven_r}R | Partial {partial_r}R | "
-        f"Runner {runner_trail_mult}×ATR | {hold_days}-day max hold{confirm_caption}"
+        f"Runner {runner_trail_mult}×ATR | {hold_days}-day max hold{confirm_caption}{sector_caption}"
     )
     st.warning(
         "The historical backtest is TECHNICAL ONLY. The live earnings-growth gate is "
