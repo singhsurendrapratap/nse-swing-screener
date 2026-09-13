@@ -31,7 +31,7 @@ from engine import (
     evaluate_positions,
 )
 
-APP_VERSION = "app-2026-09-13-a-bigger-sample"
+APP_VERSION = "app-2026-09-13-b-contraction-slider"
 
 POSITIONS_FILE = "positions.csv"
 POSITIONS_COLS = ["Symbol", "Entry Date", "Entry Price", "Qty", "Stop", "Target"]
@@ -129,6 +129,21 @@ with st.sidebar:
         help="LIVE screener only. It is not used in the historical backtest because "
              "this workflow does not have point-in-time historical earnings data."
     ) / 100
+
+    contraction_ratio_threshold = st.slider(
+        "ATR contraction bonus threshold (5-day ATR \u00f7 20-day ATR)", 0.30, 1.50,
+        float(DEFAULT_PARAMS.get("contraction_ratio_threshold", 0.80)), 0.05,
+        help="A setup earns contraction points when this ratio is BELOW the threshold "
+             "-- i.e. recent volatility has tightened vs the last 20 days (the classic "
+             "'tight base before breakout' idea). UNTESTED assumption: a large-sample "
+             "walk-forward run flagged that admitted trades with a HIGHER ratio (less "
+             "contraction, not more) actually did better, the opposite of what this "
+             "bonus rewards. NOTE: this only controls the middle scoring tier -- ratios "
+             "below 0.70 still earn points regardless of this slider, that tier is "
+             "hardcoded. Moving this slider down narrows the bonus but doesn't fully "
+             "remove it; a real test of 'does less contraction help' needs a code "
+             "change to flip the bonus's direction, not just this slider."
+    )
 
     st.divider()
     st.subheader("Exit")
@@ -301,6 +316,7 @@ params.update(
     rsi_low=rsi_low,
     rsi_high=rsi_high,
     min_earnings_growth=min_earnings_growth,
+    contraction_ratio_threshold=contraction_ratio_threshold,
     atr_stop_mult=atr_stop,
     breakeven_r=breakeven_r,
     partial_r=partial_r,
