@@ -22,7 +22,7 @@ this session, ENGINE_VERSION below exists specifically so you can confirm a
 redeploy actually took -- check the sidebar footer against this string.
 """
 
-ENGINE_VERSION = "engine-2026-09-13-p-breakout-confirmation"
+ENGINE_VERSION = "engine-2026-09-13-q-sector-rs-regime-diag"
 
 import math
 import pandas as pd
@@ -202,6 +202,16 @@ DEFAULT_PARAMS = dict(
     # signal is treated as a false breakout and skipped entirely, not entered.
     require_confirmation=False,
     confirmation_days=1,
+
+    # Sector relative strength filter -- NEW, untested. Motivated by the
+    # industry-momentum finding (Moskowitz & Grinblatt): momentum clusters by
+    # sector, not just by individual stock. When on, a candidate's SECTOR
+    # (synthetic proxy built from universe members, since no real NSE sector
+    # index feed is available here) must also be outperforming the Nifty,
+    # not just the stock itself. Backtest/walk-forward/agent path only --
+    # NOT yet available in the live screener (see engine.py comments).
+    require_sector_strength=False,
+    min_sector_rs=0.0,
 
     # Fixed research constants; change only after out-of-sample testing.
     rs_lookback=63,
@@ -558,6 +568,15 @@ def score_setup(row, market_ok: bool, params: dict, earnings_growth=None, includ
         and (pd.isna(row.get("GapPct")) or abs(row["GapPct"]) <= params.get("max_gap_pct", 4.0))
         and earnings_ok
     )
+
+    if params.get("require_sector_strength", False):
+        sector_rs = row.get("SectorRS")
+        # Fail OPEN, not closed, when the sector proxy is unavailable for this
+        # stock (e.g. unmapped/"Other", or too few sector peers in the
+        # universe to build a proxy) -- an untagged stock shouldn't be
+        # silently blocked by a gate that has no data to evaluate.
+        if pd.notna(sector_rs):
+            mandatory = mandatory and sector_rs >= params.get("min_sector_rs", 0.0)
 
     return {
         "score": _clip_score(technical_score),
@@ -1045,6 +1064,57 @@ def debug_breadth_application(universe: list, years: float = 3) -> dict:
     }
 
 
+def diagnose_regime_by_period(universe: list, years: float = 8, min_breadth_pct=None) -> dict:
+    """
+    Directly answers a question raised by the walk-forward results: did the
+    existing market-regime (and optional breadth) gate actually shut off
+    trading during the known-bad corrective periods, or did it stay "on"
+    and let the app keep trading straight through them? Checked against 3
+    known FII-outflow-driven corrections identified from real market history
+    (not tuned/cherry-picked to this app's own results).
+    """
+    fetched = _fetch_universe_data(universe, years)
+    market_regime = fetched.get("market_regime", pd.Series(dtype=bool))
+    breadth = fetched.get("breadth", pd.Series(dtype=float))
+    if market_regime.empty:
+        return {"error": "Market regime series is empty -- fetch may have failed."}
+
+    periods = {
+        "2021-10 to 2022-06 (known FII-outflow correction)": ("2021-10-01", "2022-07-01"),
+        "2024-10 to 2025-06 (known correction)": ("2024-10-01", "2025-07-01"),
+        "2025-07 onward (choppy)": ("2025-07-01", "2099-01-01"),
+    }
+    idx = pd.to_datetime(market_regime.index)
+    all_lo = min(pd.Timestamp(lo) for lo, hi in periods.values())
+    in_any_known_period = pd.Series(False, index=idx)
+
+    results = {}
+    for label, (lo, hi) in periods.items():
+        lo, hi = pd.Timestamp(lo), pd.Timestamp(hi)
+        mask = (idx >= lo) & (idx < hi)
+        in_any_known_period |= mask
+        n = int(mask.sum())
+        if n == 0:
+            results[label] = {"n_days": 0, "note": "no data in this window (may be before/after fetch range)"}
+            continue
+        regime_on_pct = float(market_regime[mask].mean() * 100)
+        entry = {"n_days": n, "pct_days_regime_bullish": round(regime_on_pct, 1)}
+        if min_breadth_pct and not breadth.empty:
+            b = breadth.reindex(idx, method=None)[mask]
+            b_valid = b.dropna()
+            if len(b_valid):
+                entry["pct_days_breadth_would_also_block"] = round(float((b_valid < min_breadth_pct).mean() * 100), 1)
+        results[label] = entry
+
+    rest_mask = ~in_any_known_period & (idx >= all_lo - pd.Timedelta(days=3650))
+    if rest_mask.sum() > 0:
+        results["Rest of history (trending)"] = {
+            "n_days": int(rest_mask.sum()),
+            "pct_days_regime_bullish": round(float(market_regime[rest_mask].mean() * 100), 1),
+        }
+    return results
+
+
 def diagnose_breadth(universe: list, years: float = 3) -> dict:
     """
     Diagnostic tool -- computes the actual historical breadth series and
@@ -1136,6 +1206,68 @@ def _fetch_universe_data(universe, years) -> dict:
     return {"market_regime": market_regime, "nifty_close": nifty_close, "data": data, "breadth": breadth}
 
 
+# -----------------------------------------------------------------------------
+# SECTOR RELATIVE STRENGTH (optional filter, backtest path only for now)
+# -----------------------------------------------------------------------------
+#
+# Motivated by Moskowitz & Grinblatt's industry-momentum finding: momentum
+# clusters by sector, not just by stock. Right now every gate/score is
+# stock-vs-Nifty only -- a stock can look individually strong while its whole
+# sector is quietly rolling over. This builds a SYNTHETIC sector index (no
+# real NSE sector-index feed available from this environment, consistent
+# with why the universes themselves are hand-curated rather than pulled from
+# an automated feed) from the equal-weighted average daily return of every
+# universe stock tagged with that sector, then expresses it the same way
+# stock-level RS already is: N-day return vs the Nifty's own N-day return.
+#
+# NOTE: backtest/walk-forward/agent path only. The live screener does not yet
+# build a full-universe prepared set the way the backtest does, so it doesn't
+# have sector proxies available -- extending it would mean restructuring how
+# screen_today fetches data, which hasn't been done here.
+
+def _build_sector_proxies(universe, prepared: dict, nifty_close: pd.Series, rs_lookback: int) -> dict:
+    """Returns {sector: pd.Series of SectorRS (%), indexed by date}."""
+    sector_daily_returns = {}
+    for sym in universe:
+        df = prepared.get(sym)
+        if df is None or df.empty or "Close" not in df.columns:
+            continue
+        sector = get_sector(sym)
+        if sector == "Other":
+            continue  # don't dilute a real sector's proxy with unmapped tickers
+        sector_daily_returns.setdefault(sector, []).append(df["Close"].pct_change())
+
+    sector_rs = {}
+    if nifty_close.empty:
+        return sector_rs
+    for sector, rets in sector_daily_returns.items():
+        if len(rets) < 2:
+            continue  # need at least 2 member stocks for a meaningful proxy
+        combined = pd.concat(rets, axis=1)
+        sector_avg_return = combined.mean(axis=1, skipna=True)
+        sector_index = (1 + sector_avg_return.fillna(0)).cumprod()
+        nifty_aligned = nifty_close.reindex(sector_index.index, method="ffill")
+        sector_rs[sector] = sector_index.pct_change(rs_lookback) * 100 - nifty_aligned.pct_change(rs_lookback) * 100
+    return sector_rs
+
+
+def _attach_sector_rs(universe, prepared: dict, nifty_close: pd.Series, rs_lookback: int) -> None:
+    """Mutates `prepared` in place, adding a SectorRS column to every symbol's
+    dataframe -- so score_setup can read it exactly like any other precomputed
+    column (RS_Diff63, ATR14, etc.), no special-casing needed downstream."""
+    sector_rs = _build_sector_proxies(universe, prepared, nifty_close, rs_lookback)
+    for sym in universe:
+        df = prepared.get(sym)
+        if df is None or df.empty:
+            continue
+        sector = get_sector(sym)
+        proxy = sector_rs.get(sector)
+        if proxy is None:
+            df["SectorRS"] = np.nan
+        else:
+            df["SectorRS"] = proxy.reindex(df.index, method="ffill")
+
+
 def _prepare_symbol_frames(universe, fetched: dict, rs_lookback: int = 63) -> dict:
     """
     Computes indicators + relative strength ONCE per symbol. Neither depends
@@ -1158,6 +1290,7 @@ def _prepare_symbol_frames(universe, fetched: dict, rs_lookback: int = 63) -> di
             prepared[sym] = df
         except Exception:
             continue
+    _attach_sector_rs(universe, prepared, nifty_close, rs_lookback)
     return prepared
 
 
