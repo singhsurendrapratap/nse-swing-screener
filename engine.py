@@ -22,7 +22,7 @@ this session, ENGINE_VERSION below exists specifically so you can confirm a
 redeploy actually took -- check the sidebar footer against this string.
 """
 
-ENGINE_VERSION = "engine-2026-09-13-o-multi-window-wf"
+ENGINE_VERSION = "engine-2026-09-13-p-breakout-confirmation"
 
 import math
 import pandas as pd
@@ -188,6 +188,20 @@ DEFAULT_PARAMS = dict(
     #   the breadth gate before it.
     selection_mode="relative",
     rank_top_pct=25,
+
+    # Entry timing -- NEW, untested. The evidence motivating this: across every
+    # walk-forward run so far, ~55-60% of trades hit initial_stop almost
+    # immediately, and NONE of the entry-quality components (breakout size,
+    # volume, RS, extension) predicted which breakouts would fail vs hold.
+    # That combination looks like "the exact breakout day is a noisy, often-
+    # false signal" more than "the scoring formula is wrong" -- consistent
+    # with breakout patterns getting more crowded/faded as more systematic
+    # capital chases the same obvious trigger. require_confirmation, when on,
+    # withholds entry until price actually HOLDS above the broken level
+    # (High20) for confirmation_days first -- if it closes back below, the
+    # signal is treated as a false breakout and skipped entirely, not entered.
+    require_confirmation=False,
+    confirmation_days=1,
 
     # Fixed research constants; change only after out-of-sample testing.
     rs_lookback=63,
@@ -781,17 +795,57 @@ def backtest_symbol(df: pd.DataFrame, market_regime: pd.Series, params: dict, br
             passes_floor = day_cutoff is None or result["score"] >= day_cutoff
 
         if passes_floor:
-            entry_day = df.iloc[i + 1]
-            gap_pct = max(0.0, (entry_day["Open"] / row["Close"] - 1) * 100) if row["Close"] else 0.0
+            require_confirmation = params.get("require_confirmation", False)
+
+            if require_confirmation:
+                conf_days = max(1, int(params.get("confirmation_days", 1)))
+                breakout_level = row.get("High20")
+                confirmed = pd.notna(breakout_level)
+                last_check_idx = i
+                if confirmed:
+                    for d in range(1, conf_days + 1):
+                        last_check_idx = i + d
+                        # Need at least one more day after the last confirmation
+                        # day to actually execute the entry -- if we're too
+                        # close to the end of history, there's no room to enter.
+                        if last_check_idx >= len(df) - 1:
+                            confirmed = False
+                            break
+                        check_close = df.iloc[last_check_idx]["Close"]
+                        # Confirmation rule: price must hold ABOVE the level it
+                        # broke out over. Closing back below it means the
+                        # breakout already failed -- exactly the false-breakout
+                        # pattern the immediate-stop-out data pointed at.
+                        if pd.isna(check_close) or check_close < breakout_level:
+                            confirmed = False
+                            break
+                if not confirmed:
+                    # False/unconfirmed breakout: no trade taken at all, not
+                    # even a bad one. Move on and keep scanning for the next
+                    # signal, same as any other day that doesn't qualify.
+                    i += 1
+                    continue
+                entry_idx = last_check_idx + 1
+                prior_day = df.iloc[entry_idx - 1]
+                # ATR as of the day just before actual entry, not the stale
+                # original signal day -- more realistic risk sizing when
+                # entry has been delayed by 1-2 days.
+                atr_entry = prior_day["ATR14"]
+            else:
+                entry_idx = i + 1
+                prior_day = row
+                atr_entry = row["ATR14"]
+
+            entry_day = df.iloc[entry_idx]
+            gap_pct = max(0.0, (entry_day["Open"] / prior_day["Close"] - 1) * 100) if prior_day["Close"] else 0.0
             effective_friction = params["friction_pct"] + gap_pct / 100 * params.get("gap_slippage_frac", 0.0)
             entry_price = entry_day["Open"] * (1 + effective_friction)
-            atr_entry = row["ATR14"]
             if pd.isna(atr_entry) or atr_entry <= 0:
                 i += 1
                 continue
 
             r_multiple, days_held, exit_index, exit_reason = simulate_layered_exit(
-                df, i, entry_price, atr_entry, params
+                df, entry_idx - 1, entry_price, atr_entry, params
             )
             components = result["components"]
             trades.append({
