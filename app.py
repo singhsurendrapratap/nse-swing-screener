@@ -32,7 +32,7 @@ from engine import (
     evaluate_positions,
 )
 
-APP_VERSION = "app-2026-09-13-c-multi-window-wf"
+APP_VERSION = "app-2026-09-13-d-breakout-confirmation"
 
 POSITIONS_FILE = "positions.csv"
 POSITIONS_COLS = ["Symbol", "Entry Date", "Entry Price", "Qty", "Stop", "Target"]
@@ -116,6 +116,27 @@ with st.sidebar:
                  "narrows further: on a day with many strong setups, only the "
                  "best X% of them qualify. On a quiet day with one or two decent "
                  "setups, everyone that cleared the floor still gets through.",
+        )
+
+    st.divider()
+    require_confirmation = st.checkbox(
+        "🆕 Require breakout confirmation before entering",
+        value=False,
+        help="UNTESTED, new hypothesis: instead of buying the day after a breakout "
+             "unconditionally, wait for price to actually HOLD above the level it "
+             "broke out over for N day(s) first. If it closes back below that level "
+             "instead, the signal is treated as a false breakout and skipped entirely "
+             "-- no trade, not even a bad one. Motivated by walk-forward data showing "
+             "~55-60% of trades were hitting the initial stop almost immediately, with "
+             "none of the entry-quality scores predicting which breakouts would fail.",
+    )
+    confirmation_days = 1
+    if require_confirmation:
+        confirmation_days = st.slider(
+            "Confirmation days required", 1, 3, 1,
+            help="How many days price must hold above the breakout level before entry. "
+                 "Entry happens the day AFTER the last confirmation day. More days = fewer, "
+                 "later, more-confirmed entries; you'll give up some of the early move.",
         )
 
     st.divider()
@@ -314,6 +335,8 @@ params.update(
     max_trades_per_day=max_trades,
     selection_mode=selection_mode,
     rank_top_pct=rank_top_pct,
+    require_confirmation=require_confirmation,
+    confirmation_days=confirmation_days,
     rsi_low=rsi_low,
     rsi_high=rsi_high,
     min_earnings_growth=min_earnings_growth,
@@ -593,10 +616,13 @@ with tab2:
     mode_caption = (
         f"top {rank_top_pct}% ranked (relative)" if selection_mode == "relative" else "absolute threshold"
     )
+    confirm_caption = (
+        f" | 🆕 {confirmation_days}-day breakout confirmation required" if require_confirmation else ""
+    )
     st.caption(
         f"Quality score ≥ {score_threshold}/100, {mode_caption} | Max {max_trades} trades/day | "
         f"Stop {atr_stop}×ATR | BE {breakeven_r}R | Partial {partial_r}R | "
-        f"Runner {runner_trail_mult}×ATR | {hold_days}-day max hold"
+        f"Runner {runner_trail_mult}×ATR | {hold_days}-day max hold{confirm_caption}"
     )
     st.warning(
         "The historical backtest is TECHNICAL ONLY. The live earnings-growth gate is "
