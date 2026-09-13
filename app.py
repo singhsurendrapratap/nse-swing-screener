@@ -31,7 +31,7 @@ from engine import (
     evaluate_positions,
 )
 
-APP_VERSION = "app-2026-09-12-m-relative-rank"
+APP_VERSION = "app-2026-09-13-a-bigger-sample"
 
 POSITIONS_FILE = "positions.csv"
 POSITIONS_COLS = ["Symbol", "Entry Date", "Entry Price", "Qty", "Stop", "Target"]
@@ -184,16 +184,33 @@ with st.sidebar:
     st.divider()
     universe_choice = st.radio(
         "Universe",
-        ["Large-cap (Nifty 50-ish)", "Mid/Small-cap (higher momentum, higher risk)"],
+        ["Large-cap (Nifty 50-ish)", "Mid/Small-cap (higher momentum, higher risk)",
+         "🆕 Combined (both — biggest sample, mixed bias)"],
         index=0,
     )
     if universe_choice.startswith("Mid"):
         st.warning("Mid/small-cap universe has survivorship bias because today's survivors are used historically.")
         default_universe = MIDSMALLCAP_UNIVERSE
+    elif universe_choice.startswith("🆕"):
+        st.warning(
+            "Combined pulls in the Mid/Small-cap list too, so its survivorship bias "
+            "(today's known survivors, tested against the past) applies to that portion "
+            "of the sample. Use this to get more trades for statistical power -- not as "
+            "a cleaner backtest than Large-cap alone."
+        )
+        # Dedup while preserving order, in case a ticker ever appears in both lists.
+        default_universe = list(dict.fromkeys(list(STABLE_UNIVERSE) + list(DYNAMIC_UNIVERSE)))
     else:
         default_universe = DEFAULT_UNIVERSE
     universe = st.multiselect("Tickers", default_universe, default=default_universe)
-    backtest_years = st.slider("Backtest lookback (years)", 1, 5, 3)
+    backtest_years = st.slider(
+        "Backtest lookback (years)", 1, 8, 3,
+        help="Longer lookback = more trades = more statistically trustworthy correlations "
+             "and win rates, at the cost of a slower fetch/backtest. Recently-listed tickers "
+             "(e.g. post-2018 IPOs) simply won't have data that far back -- they're skipped "
+             "automatically for years they didn't trade, not padded or estimated."
+    )
+    st.caption(f"Universe: **{len(universe)} tickers** selected \u00d7 **{backtest_years} years** \u2192 more of both means a bigger, more trustworthy trade sample.")
 
     if use_breadth_gate:
         with st.expander("🔍 Diagnose actual breadth values (do this before trusting the gate)"):
