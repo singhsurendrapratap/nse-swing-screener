@@ -22,7 +22,7 @@ this session, ENGINE_VERSION below exists specifically so you can confirm a
 redeploy actually took -- check the sidebar footer against this string.
 """
 
-ENGINE_VERSION = "engine-2026-09-12-n-relative-rank"
+ENGINE_VERSION = "engine-2026-09-13-o-multi-window-wf"
 
 import math
 import pandas as pd
@@ -1202,6 +1202,64 @@ def _summarize_trades(trades_df: pd.DataFrame, params: dict) -> dict:
 def run_backtest(universe, years, params, return_candidates=False) -> tuple[pd.DataFrame, dict]:
     trades_df = _generate_all_trades(universe, years, params)
     return trades_df, _summarize_trades(trades_df, params)
+
+
+def run_multi_window_walk_forward(universe, years, params, split_dates: list) -> dict:
+    """
+    The direct fix for a failure mode this project just hit firsthand: the
+    exact same frozen config (RSI ceiling 65) looked meaningfully better than
+    baseline against a 2025-01-01 split and meaningfully WORSE against a
+    2025-07-01 split of the identical underlying data. Neither verdict alone
+    was trustworthy -- a single split is one throw of the dice.
+
+    Tests the SAME frozen params against SEVERAL out-of-sample start dates.
+    A configuration that only looks good against one particular split and
+    falls apart against the others isn't a validated edge -- it's a fit to
+    whatever happened to be true in that one window.
+
+    Trades are generated ONCE (same params, full history) and then sliced by
+    each split date -- no re-fetching or re-running the backtest per window,
+    same "prepare once, reuse many times" pattern as everywhere else here.
+    """
+    trades_df = _generate_all_trades(universe, years, params)
+    if trades_df.empty or len(trades_df) < 10:
+        return {"trades_df": trades_df, "windows": [], "n_windows": 0}
+
+    trades_df["entry_date"] = pd.to_datetime(trades_df["entry_date"])
+    trades_df = trades_df.sort_values("entry_date").reset_index(drop=True)
+
+    windows = []
+    for sd in split_dates:
+        cutoff = pd.to_datetime(sd)
+        in_df = trades_df[trades_df["entry_date"] < cutoff].reset_index(drop=True)
+        out_df = trades_df[trades_df["entry_date"] >= cutoff].reset_index(drop=True)
+        windows.append({
+            "split_date": sd,
+            "in_sample": _summarize_trades(in_df, params),
+            "out_sample": _summarize_trades(out_df, params),
+        })
+
+    # A window only counts toward the verdict if both halves have enough
+    # trades to mean anything -- an empty or tiny half isn't a real test,
+    # it's noise dressed up as a result.
+    valid = [w for w in windows
+             if w["in_sample"].get("total_trades", 0) >= 10 and w["out_sample"].get("total_trades", 0) >= 10]
+    oos_expectancies = [w["out_sample"]["expectancy_r"] for w in valid]
+    n_generalized = sum(
+        1 for w in valid
+        if w["out_sample"]["expectancy_r"] >= w["in_sample"]["expectancy_r"] - 0.05
+    )
+
+    return {
+        "trades_df": trades_df,
+        "windows": windows,
+        "n_windows": len(windows),
+        "n_valid_windows": len(valid),
+        "n_generalized": n_generalized,
+        "oos_expectancies": oos_expectancies,
+        "oos_expectancy_mean": float(np.mean(oos_expectancies)) if oos_expectancies else None,
+        "oos_expectancy_std": float(np.std(oos_expectancies)) if len(oos_expectancies) > 1 else 0.0,
+    }
 
 
 def run_walk_forward_backtest(universe, years, params, out_sample_frac: float = 0.35, split_date: str = None) -> dict:
